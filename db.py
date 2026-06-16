@@ -330,6 +330,56 @@ def _get_wp_upload_url() -> str:
     return os.getenv("WP_UPLOAD_URL", "https://thelocalradar.com/wp-content/uploads")
 
 
+# ── TEC index writer ──────────────────────────────────────────────────────────
+
+def _write_tec_index(conn, post_id: int, t: dict):
+    """Write rows to wp_tec_events and wp_tec_occurrences so TEC Views V2 displays the event."""
+    try:
+        start_local = t["start_local"]
+        end_local   = t["end_local"]
+        start_utc   = t["start_utc"]
+        end_utc     = t["end_utc"]
+        tz          = t["timezone"]
+
+        # Compute duration in seconds
+        try:
+            from datetime import datetime as _dt
+            dur = int((_dt.strptime(end_local, "%Y-%m-%d %H:%M:%S") -
+                       _dt.strptime(start_local, "%Y-%m-%d %H:%M:%S")).total_seconds())
+        except Exception:
+            dur = 7200
+
+        # Hash matches TEC's format: sha1 of start_date + end_date
+        import hashlib
+        h = hashlib.sha1(f"{start_local}{end_local}".encode()).hexdigest()
+
+        with conn.cursor() as cur:
+            # wp_tec_events — one row per post
+            cur.execute(
+                "INSERT INTO `wp_tec_events` "
+                "(post_id, start_date, end_date, timezone, start_date_utc, end_date_utc, duration, hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE "
+                "start_date=%s, end_date=%s, timezone=%s, start_date_utc=%s, end_date_utc=%s, duration=%s, hash=%s",
+                (post_id, start_local, end_local, tz, start_utc, end_utc, dur, h,
+                 start_local, end_local, tz, start_utc, end_utc, dur, h)
+            )
+            event_id = cur.lastrowid or post_id
+
+            # wp_tec_occurrences — one row per occurrence (non-recurring = one)
+            cur.execute(
+                "INSERT INTO `wp_tec_occurrences` "
+                "(event_id, post_id, start_date, start_date_utc, end_date, end_date_utc, duration, hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE "
+                "start_date=%s, start_date_utc=%s, end_date=%s, end_date_utc=%s, duration=%s, hash=%s",
+                (event_id, post_id, start_local, start_utc, end_local, end_utc, dur, h,
+                 start_local, start_utc, end_local, end_utc, dur, h)
+            )
+    except Exception as e:
+        log.warning("TEC index write failed for post %d: %s", post_id, e)
+
+
 # ── Main event writer ─────────────────────────────────────────────────────────
 
 def update_event(conn, post_id: int, event: dict) -> bool:
@@ -373,6 +423,7 @@ def update_event(conn, post_id: int, event: dict) -> bool:
                                 f"VALUES (%s, '_thumbnail_id', %s)",
                                 (post_id, att_id)
                             )
+        _write_tec_index(conn, post_id, t)
         conn.commit()
         log.info("Updated event [%d] '%s'", post_id, event.get("title"))
         return True
@@ -468,6 +519,7 @@ def insert_event(event: dict, city_config: dict = None) -> bool:
                         (post_id, att_id)
                     )
 
+        _write_tec_index(conn, post_id, t)
         conn.commit()
         log.info("Inserted event [%d] '%s' (%s)", post_id, title, event.get("city_slug"))
         return True
