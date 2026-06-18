@@ -31,7 +31,7 @@ import pymysql
 import pymysql.cursors
 import requests
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -199,18 +199,24 @@ _SKIP_DOMAINS = (
     # Ticket resellers
     "ticketmaster.com", "stubhub.com", "seatgeek.com", "axs.com",
     "livenation.com", "tmpresale.com", "vividseats.com", "viagogo.com",
+    "rateyourseats.com", "cashortrade.org", "ticketsqueeze.com",
+    "eventticketscenter.com",
     # Event aggregators
     "eventbrite.com", "songkick.com", "bandsintown.com", "setlist.fm",
     "concertarchives.org", "outhere.guide", "allevents.in", "dotstri.com",
+    "nashvilleconcerts.org", "birmingham.events",
     # Social / search / video
     "facebook.com", "instagram.com", "twitter.com", "x.com",
     "youtube.com", "google.com", "bing.com", "yahoo.com",
     "startpage.com", "mojeek.com", "yandex.com", "brave.com",
     # Review / travel sites
     "yelp.com", "tripadvisor.com", "trip.com", "foursquare.com",
-    # Reference / news
+    "visitdenver.com",
+    # Reference / news / wrong sites
     "wikipedia.org", "scoop.it", "nashville.com", "bhamterminal.com",
     "do615.com", "thrillist.com", "timeout.com", "citysearch.com",
+    # NASA and other false positives
+    "nasa.gov", "science.nasa.gov",
 )
 
 # Words that confirm a page is an events/shows calendar
