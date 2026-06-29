@@ -39,7 +39,7 @@ import logging
 import re
 import sys
 import time
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse
 
 import requests
 
@@ -50,7 +50,8 @@ from config import load_cities, _get_conn as get_connection  # reuse existing he
 log = logging.getLogger("openclaw.discover")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
+OVERPASS_HEADERS = {"User-Agent": "OpenClaw/1.0 (thelocalradar.com; thelocalradar901@gmail.com)"}
 WP_PREFIX = "wp_"
 TIMEOUT = 30
 
@@ -99,13 +100,11 @@ def overpass_query(tag_filters: list[str], lat: float, lng: float, radius_m: int
 );
 out center tags;
 """
-    encoded_body = urlencode({"data": query}).encode("utf-8")
-
     try:
         resp = requests.post(
             OVERPASS_URL,
-            data=encoded_body,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "*/*"},
+            data={"data": query},
+            headers=OVERPASS_HEADERS,
             timeout=TIMEOUT,
         )
         if resp.status_code == 429:
@@ -113,8 +112,8 @@ out center tags;
             time.sleep(10)
             resp = requests.post(
                 OVERPASS_URL,
-                data=encoded_body,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "*/*"},
+                data={"data": query},
+                headers=OVERPASS_HEADERS,
                 timeout=TIMEOUT,
             )
         resp.raise_for_status()
