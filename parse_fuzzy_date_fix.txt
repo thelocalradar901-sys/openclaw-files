@@ -1,0 +1,80 @@
+# ── Patch for scraper.py ─────────────────────────────────────────────────────
+#
+# PROBLEM CONFIRMED 2026-06-30: _parse_fuzzy_date(text, default=None) calls
+# dateutil.parser.parse(text, fuzzy=True) with NO default. dateutil then
+# silently fills any missing date components from datetime.now() -- so a
+# date_str that's actually just a bare time ("8:00 PM") or otherwise missing
+# a real date gets parsed as "today at 8:00 PM" instead of failing. This is
+# exactly what happened on Larimer Lounge: the RHP-plugin site is actually
+# JS-rendered (confirmed via curl -- no real #eventDate elements exist in
+# the static HTML the scraper fetches, only CSS rules referencing that
+# class name), so _parse_rhp() correctly bails per-event, but a later
+# fallback tier (Heuristic or Ollama) extracted SOMETHING with no real date
+# attached, and _parse_fuzzy_date's default-to-now behavior masked that
+# failure as 104 superficially-valid events all dated "today."
+#
+# THE FIX: _parse_fuzzy_date must never invent a date out of nothing. If
+# the caller doesn't supply an explicit `default`, and dateutil can't find
+# AT LEAST a real day-of-month and month in the text itself (not borrowed
+# from "now"), treat that as a parse failure and return "" -- exactly like
+# the "couldn't parse at all" path already does. This doesn't change
+# behavior for any caller that DOES pass a real default (e.g. _parse_rhp's
+# year-inference path, _section_anchor_date callers) -- only the
+# previously-dangerous bare fuzzy-parse-with-no-default path changes.
+#
+# ── Replace this function in scraper.py: ───────────────────────────────────
+
+def _parse_fuzzy_date(text: str, default: str = None) -> str:
+    """
+    Parse human-readable date strings like 'June 21 2025 7:30 PM'.
+
+    `default` lets a caller anchor missing components (most commonly:
+    no year in the visible text, e.g. "Thu, Jun 18"). Without an explicit
+    default, dateutil silently fills missing year/month/day from
+    datetime.now() at parse time -- which happens to look "correct" most
+    of the year and then quietly mis-dates events once you cross a
+    year/month boundary. Always pass an explicit default when one is
+    available (see _section_anchor_date in _parse_heuristic).
+
+    SAFETY RULE (added 2026-06-30, see Larimer Lounge incident): if no
+    `default` is supplied, this function refuses to let dateutil borrow
+    ANY component from today's date. A date string needs to stand on its
+    own -- if it doesn't contain a real day and month, that's a parse
+    failure, not "today." This prevents source bugs (e.g. a selector
+    that matches a time-only element, or a JS-rendered page where the
+    real date markup never reaches the scraper at all) from silently
+    producing plausible-looking events that are all secretly dated today.
+    """
+    if not text:
+        return ""
+    try:
+        from dateutil import parser as dp
+
+        if default:
+            dt = dp.parse(text, fuzzy=True, default=default)
+            if dt and dt.year > 2020:
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return ""
+
+        # No default supplied -- use an absurd, obviously-wrong sentinel
+        # default instead of dateutil's implicit datetime.now(). If the
+        # text doesn't contain its own real day/month/year, the parsed
+        # result will land on (or very near) this sentinel date, which we
+        # can then detect and reject -- instead of dateutil silently
+        # substituting today's date and us never knowing it happened.
+        from datetime import datetime as _dt
+        SENTINEL = _dt(1900, 1, 1)
+        dt = dp.parse(text, fuzzy=True, default=SENTINEL)
+        if dt and dt.year == 1900:
+            # Text supplied no real year/month/day of its own --
+            # dateutil fell all the way back to our sentinel, meaning
+            # this string never described an actual date. Refuse it.
+            log.warning("Refusing fuzzy-parsed date with no real date "
+                        "components: %r", text)
+            return ""
+        if dt and dt.year > 2020:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return ""
+    except Exception:
+        pass
+    return ""
