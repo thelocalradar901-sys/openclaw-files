@@ -68,6 +68,20 @@ def fetch_probation_sources(conn, city_filter=None):
     return [dict(zip(cols, r)) for r in raw_rows]
 
 
+class _CaptureHandler(logging.Handler):
+    """Temporarily attached to the scraper logger during a single source's
+    test so we can inspect *why* it failed, not just whether it did."""
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        try:
+            self.messages.append(record.getMessage())
+        except Exception:
+            pass
+
+
 def vet_source(row, city):
     """Returns (verdict, event_count, sample_titles, error_str)"""
     source = {
@@ -77,15 +91,30 @@ def vet_source(row, city):
         "source_type": row["source_type"] or "squarespace",
         "city_slug":   row["city_slug"],
     }
+
+    scraper_log = logging.getLogger("openclaw.scraper")
+    capture = _CaptureHandler()
+    scraper_log.addHandler(capture)
+
     try:
         events = scrape_source(source, city)
     except Exception as e:
+        scraper_log.removeHandler(capture)
         return "REJECT", 0, [], str(e)
+
+    scraper_log.removeHandler(capture)
 
     count = len(events)
     sample = [e.get("title", "?") for e in events[:3]]
 
     if count == 0:
+        # Distinguish bot-blocking (403 Forbidden) from genuinely dead/empty
+        # sources -- a 403 means the site exists and likely has real events,
+        # it's just blocking our requests. Don't permanently reject those;
+        # leave them in probation for a UA/header retry pass instead.
+        blocked = any("403" in m or "Forbidden" in m for m in capture.messages)
+        if blocked:
+            return "REVIEW", 0, [], "403 Forbidden — likely bot-blocked, not dead. Needs UA/header retry."
         return "REJECT", 0, [], ""
     elif count >= PROMOTE_MIN_EVENTS:
         return "PROMOTE", count, sample, ""
