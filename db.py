@@ -302,6 +302,43 @@ def normalize_title_for_matching(title: str) -> str:
     return cleaned.strip().lower()
 
 
+_MIN_PREFIX_MATCH_LEN = 8  # guard against trivial short titles ("TBA", "Live") matching everything
+
+def _is_headliner_prefix_match(short_title: str, long_title: str) -> bool:
+    """
+    True if `short_title` is a clean, word-boundary prefix of `long_title` --
+    e.g. "blues traveler" vs "blues traveler w/ better than ezra".
+
+    Exists alongside the difflib ratio check in find_cross_source_match()
+    because co-headliner billing dilutes character-overlap similarity
+    below TITLE_SIMILARITY_THRESHOLD even though it's obviously the same
+    event: "blues traveler" vs "blues traveler w/ better than ezra" only
+    scores 0.58 via SequenceMatcher (confirmed 2026-07-01, Arts and Venues
+    Denver vs. the venue's own listing) -- a community/aggregator source
+    lists just the headliner while a venue-specific source lists the full
+    bill, and the appended text is long enough to sink the overall ratio
+    even though the shorter title is fully, exactly contained.
+
+    Guards against false positives:
+      - both titles already normalized (promo suffixes stripped) by the
+        caller before reaching here
+      - short_title must be at least _MIN_PREFIX_MATCH_LEN chars, so
+        something like "Live" doesn't prefix-match half the calendar
+      - must be a WORD boundary, not a mid-word truncation -- long_title
+        must equal short_title exactly, or the very next character must
+        be a separator (space, pipe, paren, dash) so "blues travel" does
+        NOT prefix-match "blues traveler" (real different event/typo)
+    """
+    if len(short_title) < _MIN_PREFIX_MATCH_LEN:
+        return False
+    if not long_title.startswith(short_title):
+        return False
+    if len(long_title) == len(short_title):
+        return True
+    next_char = long_title[len(short_title)]
+    return next_char in " |(-"
+
+
 def find_cross_source_match(conn, event: dict, resolved_times: dict) -> int | None:
     """
     Find an existing post for the SAME real-world event, scraped from a
@@ -381,6 +418,19 @@ def find_cross_source_match(conn, event: dict, resolved_times: dict) -> int | No
     for c in candidates:
         candidate_title = normalize_title_for_matching(c["post_title"] or "")
         ratio = difflib.SequenceMatcher(None, title, candidate_title).ratio()
+
+        # Co-headliner billing (e.g. "Blues Traveler" vs "Blues Traveler
+        # w/ Better Than Ezra") dilutes the plain ratio below threshold
+        # even when one title is a clean prefix of the other -- check
+        # both directions since we don't know which source has the
+        # fuller listing.
+        is_prefix_match = (
+            _is_headliner_prefix_match(title, candidate_title) or
+            _is_headliner_prefix_match(candidate_title, title)
+        )
+        if is_prefix_match:
+            ratio = max(ratio, TITLE_SIMILARITY_THRESHOLD)  # ensures it clears the gate below
+
         if ratio >= TITLE_SIMILARITY_THRESHOLD and ratio > best_ratio:
             best_ratio = ratio
             best_id    = c["ID"]
