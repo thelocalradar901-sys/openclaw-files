@@ -692,6 +692,12 @@ def _parse_rhp(html: str, base_url: str, source: dict,
         if img_el:
             image_url = img_el.get("src") or img_el.get("data-src") or ""
 
+        # Same og:image fallback as _parse_heuristic/_parse_ical -- RHP
+        # markup doesn't always carry a thumbnail on the listing page even
+        # when the event's own detail page has one.
+        if not image_url and ticket_url:
+            image_url = _fetch_og_image(ticket_url)
+
         price_match = _PRICE_RE.search(card_text)
         cost_text   = ""
         if price_match:
@@ -901,13 +907,23 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
         # them noisy for fingerprinting, while hitonecafe.com/event/...
         # links are stable per show.
         external_id = r["source_url"] or r["ticket_url"]
+
+        # Fallback: heuristic DOM scraping frequently finds no <img> at all
+        # (inconsistent site layouts) even though the event's own detail
+        # page almost always has an og:image meta tag. Same pattern already
+        # used for iCal events in _parse_ical -- generalized here since the
+        # heuristic tier hits this gap far more often than iCal does.
+        image_url = r["image_url"]
+        if not image_url and r["ticket_url"]:
+            image_url = _fetch_og_image(r["ticket_url"])
+
         events.append(_ev(
             title=r["title"], description=r["desc"],
             start_date=start_date, end_date=start_date,
             venue_name=source.get("name", ""),
             ticket_url=r["ticket_url"], source=source,
             city_slug=city_slug, city_name=city_name,
-            image_url=r["image_url"],
+            image_url=image_url,
             cost=r["cost"],
             external_id=external_id,
         ))
