@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 from config import (
     TICKETMASTER_API_KEY, TM_SEGMENTS, TM_RADIUS,
@@ -160,6 +161,56 @@ def _pull_window(city: dict, lat: float, lng: float, tz: ZoneInfo, tz_name: str,
     return events
 
 
+def _extract_ticketweb_url(raw_url: str) -> str:
+    """
+    TM's Discovery API sometimes returns TicketWeb-sourced event URLs
+    already wrapped in an Impact/affiliate tracking redirect, e.g.
+    "ticketmaster.evyy.net/c/.../?u=<url-encoded-ticketweb-url>&..."
+    rather than a direct ticketweb.com link. Unwrap it so we can fetch
+    the real TicketWeb page for its actual event photo.
+
+    Confirmed 2026-07-02: TM's own `images` array for TicketWeb-sourced
+    listings is a generic placeholder, not the real event flyer -- the
+    real flyer only exists on TicketWeb's own page, exposed via
+    twitter:image (see _fetch_ticketweb_image below).
+    """
+    if not raw_url:
+        return ""
+    if "ticketweb.com" in raw_url and "u=" not in raw_url:
+        return raw_url  # already a direct, unwrapped ticketweb.com link
+    from urllib.parse import urlparse, parse_qs, unquote
+    parsed = urlparse(raw_url)
+    qs = parse_qs(parsed.query)
+    if "u" in qs:
+        candidate = unquote(qs["u"][0])
+        if "ticketweb.com" in candidate:
+            return candidate
+    return ""
+
+
+def _fetch_ticketweb_image(ticketweb_url: str) -> str:
+    """
+    TicketWeb event pages expose their real event flyer via the
+    twitter:image meta tag, NOT og:image (confirmed 2026-07-02 --
+    TicketWeb pages simply don't set og:image at all). Best-effort
+    fetch; failure is always silent and returns "" so it never blocks
+    an event from saving with whatever image TM already provided.
+    """
+    if not ticketweb_url:
+        return ""
+    try:
+        resp = requests.get(ticketweb_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = (soup.find("meta", {"name": "twitter:image"}) or
+               soup.find("meta", {"property": "og:image"}))
+        if tag and tag.get("content"):
+            return tag["content"]
+    except Exception as e:
+        log.debug("TicketWeb image fetch failed for %s: %s", ticketweb_url, e)
+    return ""
+
+
 def _normalize(raw: dict, city: dict, tz: ZoneInfo, tz_name: str) -> dict | None:
     try:
         title = (raw.get("name") or "").strip()
@@ -196,6 +247,18 @@ def _normalize(raw: dict, city: dict, tz: ZoneInfo, tz_name: str) -> dict | None
 
         # ── Image ─────────────────────────────────────────────────────────────
         image_url = _best_image(raw.get("images", []))
+
+        # TicketWeb-sourced listings: TM's own image is a generic
+        # placeholder, not the real flyer. Override with the actual
+        # image from TicketWeb's own page when this event is TicketWeb-
+        # sourced. Adds one HTTP request per TicketWeb event -- accepted
+        # tradeoff, same pattern already used for og:image backfill
+        # elsewhere in the scraper.
+        ticketweb_url = _extract_ticketweb_url(raw.get("url", ""))
+        if ticketweb_url:
+            real_image = _fetch_ticketweb_image(ticketweb_url)
+            if real_image:
+                image_url = real_image
 
         # ── Ticket URL with affiliate ID ──────────────────────────────────────
         ticket_url = raw.get("url", "")
