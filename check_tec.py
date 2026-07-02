@@ -1,5 +1,5 @@
 import json
-p = json.load(open('/tmp/tec_filtered.json'))
+p = json.load(open('/tmp/tec_bounded.json'))
 print('total_events:', p.get('total_events'))
 print('total_pages:', p.get('total_pages'))
 print('count:', len(p.get('events', [])))
