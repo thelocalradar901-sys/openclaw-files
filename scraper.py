@@ -19,7 +19,7 @@ All fetchers return list of dicts with these keys:
 import logging
 import re
 import time
-from datetime import datetime, date, timezone as _timezone
+from datetime import datetime, date, timedelta as _timedelta, timezone as _timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -1089,14 +1089,49 @@ def _infer_year(month_abbr: str) -> int:
 # ── TEC REST ──────────────────────────────────────────────────────────────────
 
 def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]:
+    """
+    WordPress TEC (The Events Calendar) REST API.
+
+    IMPORTANT: TEC's /wp-json/tribe/events/v1/events endpoint does NOT
+    reliably respect start_date/end_date query params on every site --
+    confirmed 2026-07-01 on bhamnow.com, where total_pages stayed at 200
+    (~10,000 events) regardless of start_date/end_date filters. Those
+    100+ "pages" are overwhelmingly recurring weekly classes/camps each
+    counted as a separate occurrence stretching months or years out --
+    not a real data problem, just an unbounded feed.
+
+    Without a cap, the old `while True` version here would sequentially
+    fetch all 200 pages (100+ seconds minimum just in sleep time, plus
+    real request latency) every single scrape cycle. Bounded the same
+    way ticketmaster.py bounds its 90-day lookahead: a real date horizon
+    checked against each page's results (stop once we're past it, since
+    TEC returns events in chronological order) PLUS a hard page-count
+    ceiling as a backstop in case a site's sort order is ever different
+    than expected.
+    """
     from urllib.parse import urlparse
     parsed  = urlparse(source["url"].rstrip("/"))
     api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/tribe/events/v1/events"
-    today   = datetime.now().strftime("%Y-%m-%d")
-    params  = {"per_page": 50, "status": "publish", "start_date": today, "page": 1}
-    events  = []
 
-    while True:
+    HORIZON_DAYS = 90
+    MAX_PAGES    = 20  # backstop: 20 pages * 50/page = 1000 events max, regardless of dates
+
+    today   = datetime.now()
+    horizon = today + _timedelta(days=HORIZON_DAYS)
+    today_str   = today.strftime("%Y-%m-%d")
+    horizon_str = horizon.strftime("%Y-%m-%d")
+
+    params = {
+        "per_page":   50,
+        "status":     "publish",
+        "start_date": today_str,
+        "end_date":   horizon_str,  # passed even though not confirmed effective on every site --
+                                     # harmless if ignored, helpful if honored
+        "page":       1,
+    }
+    events = []
+
+    while params["page"] <= MAX_PAGES:
         try:
             resp = requests.get(api_url, params=params, headers=HEADERS, timeout=TIMEOUT)
             resp.raise_for_status()
@@ -1105,7 +1140,22 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
             log.warning("TEC REST error page %d for %s: %s", params["page"], source.get("name"), e)
             break
 
-        for item in data.get("events", []):
+        page_events = data.get("events", [])
+        if not page_events:
+            break
+
+        hit_horizon = False
+        for item in page_events:
+            start_raw = item.get("start_date", "")
+            start_norm = _normalize_dt(start_raw)
+
+            # Stop once we've crossed the horizon -- TEC returns events in
+            # chronological order, so everything from here on this page
+            # (and every subsequent page) is also beyond the window.
+            if start_norm and start_norm[:10] > horizon_str:
+                hit_horizon = True
+                break
+
             title = BeautifulSoup(
                 (item.get("title") or {}).get("rendered", "") or item.get("title", ""),
                 "html.parser"
@@ -1120,8 +1170,8 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
             img   = item.get("image") or {}
             events.append(_ev(
                 title=title, description=desc,
-                start_date=_normalize_dt(item.get("start_date", "")),
-                end_date=_normalize_dt(item.get("end_date") or item.get("start_date", "")),
+                start_date=start_norm,
+                end_date=_normalize_dt(item.get("end_date") or start_raw),
                 venue_name=venue.get("venue", "") if isinstance(venue, dict) else "",
                 ticket_url=item.get("url", ""),
                 source=source, city_slug=city_slug, city_name=city_name,
@@ -1130,12 +1180,21 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
                 external_id=f"tec_{item.get('id', '')}",
             ))
 
+        if hit_horizon:
+            log.info("[%s] TEC REST: reached %d-day horizon at page %d, stopping",
+                     source.get("name"), HORIZON_DAYS, params["page"])
+            break
         if params["page"] >= data.get("total_pages", 1):
             break
         params["page"] += 1
         time.sleep(0.5)
+    else:
+        log.warning("[%s] TEC REST: hit %d-page safety cap before reaching horizon -- "
+                    "site may have unusually dense listings, consider a smaller HORIZON_DAYS",
+                    source.get("name"), MAX_PAGES)
 
-    log.info("[%s] TEC REST: %d events", source.get("name"), len(events))
+    log.info("[%s] TEC REST: %d events (within %d-day horizon)",
+             source.get("name"), len(events), HORIZON_DAYS)
     return events
 
 
