@@ -74,23 +74,38 @@ def scrape_source(source: dict, city) -> list[dict]:
 
     try:
         if stype == "html_auto":
-            return _scrape_html_auto(source, city_slug, city_name, tz_name)
+            events = _scrape_html_auto(source, city_slug, city_name, tz_name)
         elif stype == "seetickets":
-            return _scrape_seetickets(source, city_slug, city_name)
+            events = _scrape_seetickets(source, city_slug, city_name)
         elif stype == "tec_rest":
-            return _scrape_tec_rest(source, city_slug, city_name)
+            events = _scrape_tec_rest(source, city_slug, city_name)
         elif stype == "ical_url":
-            return _scrape_ical_url(source, city_slug, city_name, tz_name)
+            events = _scrape_ical_url(source, city_slug, city_name, tz_name)
         elif stype == "json_api":
-            return _scrape_json_api(source, city_slug, city_name)
+            events = _scrape_json_api(source, city_slug, city_name)
         elif stype == "generic_html":
-            return _scrape_generic_html(source, city_slug, city_name)
+            events = _scrape_generic_html(source, city_slug, city_name)
         else:
             log.warning("Unknown source_type '%s' — trying html_auto", stype)
-            return _scrape_html_auto(source, city_slug, city_name, tz_name)
+            events = _scrape_html_auto(source, city_slug, city_name, tz_name)
     except Exception as e:
         log.error("scrape_source crashed for '%s': %s", source.get("url"), e, exc_info=True)
         return []
+
+    # Optional per-source filter: skip events with no image. Opt-in via
+    # "require_image": true in wp_openclaw_sources.notes JSON config --
+    # off by default so this never silently changes existing sources'
+    # behavior. Applied here (not per-tier) so it works uniformly no
+    # matter which scraping tier actually produced the events.
+    if source.get("require_image"):
+        before = len(events)
+        events = [e for e in events if e.get("image_url")]
+        dropped = before - len(events)
+        if dropped:
+            log.info("[%s] require_image filter: dropped %d/%d events with no image",
+                     source.get("name"), dropped, before)
+
+    return events
 
 
 # ── Event dict factory ────────────────────────────────────────────────────────
@@ -1125,7 +1140,11 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
     parsed  = urlparse(source["url"].rstrip("/"))
     api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/tribe/events/v1/events"
 
-    HORIZON_DAYS = 90
+    HORIZON_DAYS = 35  # community/class-heavy TEC sites (e.g. Bham Now: ~30
+                        # events/day) can hit the MAX_PAGES cap well before
+                        # 90 days out. These are hyperlocal recurring events,
+                        # not trip-planning material -- a complete 5-week
+                        # window is more useful than a truncated 90-day one.
     MAX_PAGES    = 20  # backstop: 20 pages * 50/page = 1000 events max, regardless of dates
 
     today   = datetime.now()
