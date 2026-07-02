@@ -1088,6 +1088,18 @@ def _infer_year(month_abbr: str) -> int:
 
 # ── TEC REST ──────────────────────────────────────────────────────────────────
 
+def _tec_rendered_text(field) -> str:
+    """
+    TEC REST API title/description fields vary by site: some wrap them as
+    {"rendered": "..."} (WP core REST convention), others (confirmed on
+    bhamnow.com, 2026-07-02) return a plain string directly. Handle both
+    without crashing.
+    """
+    if isinstance(field, dict):
+        return field.get("rendered", "") or ""
+    return field or ""
+
+
 def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]:
     """
     WordPress TEC (The Events Calendar) REST API.
@@ -1157,13 +1169,13 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
                 break
 
             title = BeautifulSoup(
-                (item.get("title") or {}).get("rendered", "") or item.get("title", ""),
+                _tec_rendered_text(item.get("title", "")),
                 "html.parser"
             ).get_text(strip=True)
             if not title:
                 continue
             desc  = BeautifulSoup(
-                (item.get("description") or {}).get("rendered", "") or item.get("description", ""),
+                _tec_rendered_text(item.get("description", "")),
                 "html.parser"
             ).get_text(separator=" ", strip=True)
             venue = item.get("venue") or {}
