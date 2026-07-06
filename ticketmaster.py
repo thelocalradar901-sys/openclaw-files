@@ -198,16 +198,28 @@ def _fetch_ticketweb_image(ticketweb_url: str) -> str:
     """
     if not ticketweb_url:
         return ""
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.ticketweb.com/",
+    }
     try:
-        resp = requests.get(ticketweb_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp = requests.get(ticketweb_url, headers=headers, timeout=10)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         tag = (soup.find("meta", {"name": "twitter:image"}) or
                soup.find("meta", {"property": "og:image"}))
         if tag and tag.get("content"):
             return tag["content"]
+        else:
+            log.warning("TicketWeb page fetched OK but no image meta tag found for %s "
+                        "(status=%d, len=%d) -- possibly a bot-check/interstitial page",
+                        ticketweb_url, resp.status_code, len(resp.text))
     except Exception as e:
-        log.debug("TicketWeb image fetch failed for %s: %s", ticketweb_url, e)
+        log.warning("TicketWeb image fetch failed for %s: %s", ticketweb_url, e)
     return ""
 
 
