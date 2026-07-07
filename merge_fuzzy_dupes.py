@@ -31,6 +31,11 @@ import sys
 import argparse
 sys.path.insert(0, "/opt/openclaw")
 import difflib
+import re
+
+_NUMBERED_OCCURRENCE_RE = re.compile(
+    r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
+)
 from collections import defaultdict
 from db import (
     normalize_title_for_matching, _is_headliner_prefix_match,
@@ -108,6 +113,23 @@ def find_pairs(conn):
                 a_is_fixture = " vs " in f' {a["_norm_title"]} '
                 b_is_fixture = " vs " in f' {b["_norm_title"]} '
                 if a_is_fixture or b_is_fixture:
+                    continue
+
+                # Numbered-occurrence guard: "(Night 2)", "(Night 3)",
+                # "(Day 1)", "(Part 2)" etc mark genuinely DIFFERENT real
+                # performances in a multi-night residency, not duplicate
+                # listings of the same show. Confirmed 2026-07-07: Eric
+                # Church (Night 2) vs (Night 3), The Avett Brothers
+                # (Night 2) vs (Night 3), Tedeschi Trucks Band, and Andrea
+                # Bocelli (Night 2) all scored above threshold against
+                # either each other or the base title -- would have
+                # deleted real, separately-ticketed shows. If EITHER title
+                # has a numbered-occurrence marker at all, skip the pair;
+                # too risky to try to compare the numbers and allow a
+                # "same number" case through, since a stray marker on only
+                # one side is itself a sign these are different listings.
+                if _NUMBERED_OCCURRENCE_RE.search(a["post_title"] or "") or \
+                   _NUMBERED_OCCURRENCE_RE.search(b["post_title"] or ""):
                     continue
 
                 ratio = difflib.SequenceMatcher(None, a["_norm_title"], b["_norm_title"]).ratio()

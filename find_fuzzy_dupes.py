@@ -13,6 +13,11 @@ an image, so you can see at a glance which post to keep.
 import sys
 sys.path.insert(0, "/opt/openclaw")
 import difflib
+import re
+
+_NUMBERED_OCCURRENCE_RE = re.compile(
+    r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
+)
 from collections import defaultdict
 from db import (
     normalize_title_for_matching, _is_headliner_prefix_match,
@@ -64,6 +69,13 @@ for (city, date), posts in buckets.items():
             a_is_fixture = " vs " in f' {a["_norm_title"]} '
             b_is_fixture = " vs " in f' {b["_norm_title"]} '
             if a_is_fixture or b_is_fixture:
+                continue
+
+            # Numbered-occurrence guard -- see merge_fuzzy_dupes.py for
+            # full rationale. "(Night 2)"/"(Day 1)"/"(Part 2)" etc mark
+            # genuinely different real performances, not duplicates.
+            if _NUMBERED_OCCURRENCE_RE.search(a["post_title"] or "") or \
+               _NUMBERED_OCCURRENCE_RE.search(b["post_title"] or ""):
                 continue
 
             ratio = difflib.SequenceMatcher(None, a["_norm_title"], b["_norm_title"]).ratio()
