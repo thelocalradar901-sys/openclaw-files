@@ -12,10 +12,11 @@ pull the whole affiliate feed and filter by venue.city client-side, or
 target specific venueIds per metro.
 """
 
-import os
 import requests
 import logging
 from time import sleep
+
+from config import EVENTIM_API_KEY, EVENTIM_API_SECRET, EVENTIM_AFF_ID
 
 log = logging.getLogger("openclaw.eventim")
 
@@ -23,9 +24,9 @@ BASE_URL = "https://prod-seetickets-core.seeticketsusa.us"
 EVENTS_ENDPOINT = f"{BASE_URL}/api/v2/affiliates/events"
 TICKET_TYPES_ENDPOINT = f"{BASE_URL}/api/v2/affiliates/events/{{event_id}}/ticket-types"
 
-API_KEY = os.environ.get("EVENTIM_API_KEY")
-API_SECRET = os.environ.get("EVENTIM_API_SECRET")
-AFF_ID = os.environ.get("EVENTIM_AFF_ID", "40")  # affiliate ID 40 — hardcoded fallback
+API_KEY = EVENTIM_API_KEY
+API_SECRET = EVENTIM_API_SECRET
+AFF_ID = EVENTIM_AFF_ID or "40"  # affiliate ID 40 — fallback if env/config unset
 
 PER_PAGE = 100
 MAX_PAGES = 20  # safety cap, same spirit as MAX_PAGES on ticketmaster.py
