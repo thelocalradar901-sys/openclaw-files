@@ -1004,7 +1004,17 @@ def update_event(conn, post_id: int, event: dict, city_config: dict = None) -> b
         AFFILIATE_PRIORITY = ["ticketmaster", "eventim"]
         AFFILIATE_MARKERS = {
             "ticketmaster": lambda u: "aaid=" in u,
-            "eventim":      lambda u: "seetickets.us" in u,
+            # NOTE: real domain is "seeticketsusa.us" (confirmed in production
+            # logs 2026-07-07), NOT "seetickets.us" as originally assumed --
+            # "seeticketsusa.us" does not contain "seetickets.us" as a
+            # substring (there's a "usa" in between: seetickets-USA-.us),
+            # so the original check silently never matched. Also matches
+            # the wl.eventim.us redirect destination and the distinctive
+            # nts_trk= tracking param seen on both the redirect and
+            # final-destination URLs.
+            "eventim":      lambda u: ("seeticketsusa.us" in u or
+                                        "eventim.us" in u or
+                                        "nts_trk=" in u),
         }
 
         if ticket_url and not keep_existing_time:
