@@ -1,40 +1,44 @@
 """
 config.py – OpenClaw configuration
-
-Cities are defined here in CITIES.
-Scrape sources are loaded dynamically from wp_tlr_event_sources DB table.
-Add new venues via the WP admin plugin UI or direct DB insert.
+All runtime settings. Cities and sources are loaded from the DB (managed via
+the openclaw-monitor WP plugin). Static CITIES list is a fallback only.
 """
 
 import logging
 import os
 
-import mysql.connector
+import pymysql
+import pymysql.cursors
 
 log = logging.getLogger("openclaw.config")
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("OPENCLAW_LOG_LEVEL", "INFO")
 
-# ─── Database ───────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 DB = {
-    "host":     os.getenv("WP_DB_HOST", "localhost"),
+    "host":     os.getenv("WP_DB_HOST",     "localhost"),
     "port":     int(os.getenv("WP_DB_PORT", 3306)),
-    "user":     os.getenv("WP_DB_USER", "wpuser"),
+    "user":     os.getenv("WP_DB_USER",     "wpuser"),
     "password": os.getenv("WP_DB_PASSWORD", ""),
-    "database": os.getenv("WP_DB_NAME", "wordpress"),
+    "database": os.getenv("WP_DB_NAME",     "wordpress"),
     "charset":  "utf8mb4",
 }
 
 WP_PREFIX = os.getenv("WP_PREFIX", "wp_")
 
-# ─── Ticketmaster ───────────────────────────────────────────────────────────
+# ── Ticketmaster ──────────────────────────────────────────────────────────────
 TICKETMASTER_API_KEY = os.getenv("TICKETMASTER_API_KEY", "")
+TM_RADIUS       = "50"
+TM_UNIT         = "miles"
+TM_SIZE         = 200
+TM_AFFILIATE_ID = os.getenv("TM_AFFILIATE_ID", "7097599")
+TM_SEGMENTS     = ["Music", "Arts & Theatre", "Sports", "Family", "Miscellaneous"]
 
-# ─── Eventim / See Tickets Affiliate API ────────────────────────────────────
-# NOTE: this is the official Affiliates API (national feed, affId-scoped),
-# a different data path from any existing source_type="seetickets" entries
-# in wp_openclaw_sources (those scrape individual venue HTML pages directly,
+# ── Eventim / See Tickets Affiliate API ───────────────────────────────────────
+# Official Affiliates API (national feed, affId-scoped) -- a different data
+# path from any existing source_type="seetickets" entries in
+# wp_openclaw_sources (those scrape individual venue HTML pages directly,
 # no affiliate tracking). EVENTIM_ACCOUNT_PASSWORD is intentionally NOT
 # loaded here -- it's only used for the affiliate web portal login, never
 # sent by the API client in eventim.py.
@@ -42,91 +46,119 @@ EVENTIM_API_KEY    = os.getenv("EVENTIM_API_KEY", "")
 EVENTIM_API_SECRET = os.getenv("EVENTIM_API_SECRET", "")
 EVENTIM_AFF_ID     = os.getenv("EVENTIM_AFF_ID", "40")
 
-# ─── Ollama / Qwen3 ─────────────────────────────────────────────────────────
-OLLAMA_HOST    = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen3:14b")
+# ── Ollama / Qwen3 ────────────────────────────────────────────────────────────
+OLLAMA_HOST    = os.getenv("OLLAMA_HOST",    "http://localhost:11434")
+OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL",   "qwen3:14b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", 60))
 
-# ─── Scheduler intervals (seconds) ──────────────────────────────────────────
-TICKETMASTER_INTERVAL = int(os.getenv("TM_INTERVAL", 3600))
+# ── Scheduler intervals (seconds) ─────────────────────────────────────────────
+TICKETMASTER_INTERVAL = int(os.getenv("TM_INTERVAL",      3600))
 SCRAPER_INTERVAL      = int(os.getenv("SCRAPER_INTERVAL", 7200))
 EVENTIM_INTERVAL      = int(os.getenv("EVENTIM_INTERVAL", 3600))
 
-# ─── Cities (static — Ticketmaster DMA config) ───────────────────────────────
+# ── Image sideloading ─────────────────────────────────────────────────────────
+SIDELOAD_IMAGES = True
+IMAGE_TIMEOUT   = 15
+
+# ── Static city fallback (used only if DB is unreachable) ─────────────────────
 CITIES = [
-    {
-        "name": "Memphis",
-        "slug": "memphis",
-        "ticketmaster_dma_id": "322",
-        "wp_site_id": 1,
-        "default_category_slug": "memphis-events",
-    },
-    {
-        "name": "Denver",
-        "slug": "denver",
-        "ticketmaster_dma_id": "302",
-        "wp_site_id": 1,
-        "default_category_slug": "denver-events",
-    },
-    {
-        "name": "Nashville",
-        "slug": "nashville",
-        "ticketmaster_dma_id": "324",
-        "wp_site_id": 1,
-        "default_category_slug": "nashville-events",
-    },
-    {
-        "name": "Birmingham",
-        "slug": "birmingham",
-        "ticketmaster_dma_id": "630",
-        "wp_site_id": 1,
-        "default_category_slug": "birmingham-events",
-    },
+    {"name": "Memphis",    "slug": "memphis",    "ticketmaster_dma_id": "322", "lat": 35.1495, "lng": -90.0490, "radius_miles": 35},
+    {"name": "Denver",     "slug": "denver",     "ticketmaster_dma_id": "302", "lat": 39.7392, "lng": -104.9903, "radius_miles": 35},
+    {"name": "Nashville",  "slug": "nashville",  "ticketmaster_dma_id": "324", "lat": 36.1627, "lng": -86.7816, "radius_miles": 35},
+    {"name": "Birmingham", "slug": "birmingham", "ticketmaster_dma_id": "630", "lat": 33.5186, "lng": -86.8104, "radius_miles": 35},
 ]
 
+# ── TLR Category slugs (ONLY these 7 exist on the site) ──────────────────────
+# Map keywords → category slug. Evaluated in order; first match wins per event.
+# Fallback is always "more-to-do".
+TLR_CATEGORIES = [
+    ("live-music-concerts",   ["concert", "live music", "band", "dj set", "dj ", "jazz", "blues",
+                                "hip hop", "hip-hop", "country music", "rock show", "indie",
+                                "rap", "r&b", "soul", "folk", "metal", "punk", "singer"]),
+    ("comedy",                ["comedy", "stand-up", "standup", "stand up", "improv", "open mic",
+                                "comedian", "laughs"]),
+    ("performing-visual-arts",["theater", "theatre", "dance", "opera", "ballet", "symphony",
+                                "orchestra", "gallery", "exhibit", "museum", "film", "cinema",
+                                "art show", "art walk", "drag show", "burlesque", "magic show",
+                                "spoken word", "poetry"]),
+    ("sports-fitness",        ["game", "match", "tournament", "grizzlies", "hustle", "tigers",
+                                "nba", "nfl", "mlb", "nhl", "mls", "soccer", "football",
+                                "basketball", "baseball", "hockey", "run", "race", "5k",
+                                "marathon", "half marathon", "yoga", "cycling", "bike ride",
+                                "triathlon", "crossfit", "fitness", "workout", "gym"]),
+    ("festivals",             ["festival", "fair", "carnival", "flea market", "holiday market",
+                                "street fest", "block party", "pride", "oktoberfest", "mardi gras"]),
+    ("family-community",      ["family", "kids", "children", "youth", "parent", "toddler", "baby",
+                                "community", "volunteer", "charity", "fundraiser", "neighborhood",
+                                "civic", "town hall", "free event", "all ages"]),
+    ("more-to-do",            []),   # catch-all — always matches
+]
+
+# ── Ticketmaster segment → TLR slug ──────────────────────────────────────────
+TM_TO_TLR = {
+    "music":           "live-music-concerts",
+    "arts & theatre":  "performing-visual-arts",
+    "sports":          "sports-fitness",
+    "family":          "family-community",
+    "miscellaneous":   "more-to-do",
+    # genres
+    "classical":       "performing-visual-arts",
+    "comedy":          "comedy",
+    "dance/electronic":"live-music-concerts",
+    "jazz":            "live-music-concerts",
+    "blues":           "live-music-concerts",
+    "r&b":             "live-music-concerts",
+    "hip-hop/rap":     "live-music-concerts",
+    "rock":            "live-music-concerts",
+    "country":         "live-music-concerts",
+    "pop":             "live-music-concerts",
+    "folk":            "live-music-concerts",
+    "metal":           "live-music-concerts",
+    "theatre":         "performing-visual-arts",
+    "dance":           "performing-visual-arts",
+    "film":            "performing-visual-arts",
+}
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _get_conn():
-    return mysql.connector.connect(**DB)
+    return pymysql.connect(
+        host=DB["host"], port=DB["port"], user=DB["user"],
+        password=DB["password"], database=DB["database"],
+        charset=DB["charset"], cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
 
 
 def load_cities() -> list[dict]:
-    """
-    Load active cities from wp_openclaw_cities DB table.
-    Falls back to static CITIES list if DB is unavailable.
-    Returns list of dicts with keys: name, slug, ticketmaster_dma_id, lat, lng,
-    radius_miles, wp_site_id, default_category_slug.
-    """
+    """Load active cities from wp_openclaw_cities. Falls back to static CITIES."""
     try:
         conn = _get_conn()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT name, slug, tm_dma_id, lat, lng, radius_miles, status
-            FROM wp_openclaw_cities
-            WHERE status = 'active'
-            ORDER BY name
-        """)
-        rows = cursor.fetchall()
-        cursor.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name, slug, tm_dma_id, lat, lng, radius_miles
+                FROM wp_openclaw_cities
+                WHERE status = 'active'
+                ORDER BY name
+            """)
+            rows = cur.fetchall()
         conn.close()
 
         if not rows:
-            log.warning("No cities found in DB, falling back to static CITIES list")
+            log.warning("No active cities in DB, using static fallback")
             return CITIES
 
         cities = []
         for row in rows:
             cities.append({
-                "name":                  row["name"],
-                "slug":                  row["slug"],
-                "ticketmaster_dma_id":   row["tm_dma_id"] or "",
-                "lat":                   float(row["lat"] or 0),
-                "lng":                   float(row["lng"] or 0),
-                "radius_miles":          int(row["radius_miles"] or 35),
-                "wp_site_id":            1,
-                "default_category_slug": f"{row['slug']}-events",
+                "name":                row["name"],
+                "slug":                row["slug"],
+                "ticketmaster_dma_id": row["tm_dma_id"] or "",
+                "lat":                 float(row["lat"] or 0),
+                "lng":                 float(row["lng"] or 0),
+                "radius_miles":        int(row["radius_miles"] or 35),
             })
-
-        log.info("Loaded %d active cities from DB", len(cities))
+        log.info("Loaded %d cities from DB", len(cities))
         return cities
 
     except Exception as e:
@@ -136,105 +168,70 @@ def load_cities() -> list[dict]:
 
 def load_dynamic_sources() -> dict:
     """
-    Load active scrape sources from wp_openclaw_sources, grouped by city_slug.
-    Returns dict: { "memphis": [source_dict, ...], "denver": [...], ... }
+    Load active scrape sources from wp_openclaw_sources grouped by city_slug.
+    Returns { "memphis": [source_dict, ...], ... }
+    source_type 'auto' is aliased to 'html_auto'.
     """
+    import json as _json
     cities = load_cities()
-    sources_by_city = {city["slug"]: [] for city in cities}
+    by_city = {c["slug"]: [] for c in cities}
+
     try:
         conn = _get_conn()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT id, url, city_slug, name, source_type, notes
-            FROM wp_openclaw_sources
-            WHERE status = 'active'
-            ORDER BY city_slug, id
-        """)
-        rows = cursor.fetchall()
-        cursor.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, url, city_slug, name, source_type, notes
+                FROM wp_openclaw_sources
+                WHERE status = 'active'
+                ORDER BY city_slug, id
+            """)
+            rows = cur.fetchall()
         conn.close()
 
         for row in rows:
-            city_slug = row["city_slug"]
-            if city_slug not in sources_by_city:
-                sources_by_city[city_slug] = []
+            slug = row["city_slug"]
+            if slug not in by_city:
+                by_city[slug] = []
 
-            # Parse any extra config from notes field (stored as JSON if present)
-            import json
             extra = {}
             try:
                 if row.get("notes"):
-                    extra = json.loads(row["notes"])
+                    extra = _json.loads(row["notes"])
             except Exception:
                 pass
 
-            # Map 'auto' and 'squarespace' source_type aliases
-            stype = row["source_type"] or "squarespace"
-            if stype == "auto":
-                stype = "squarespace"
+            stype = (row["source_type"] or "html_auto").strip()
+            if stype in ("auto", "squarespace"):
+                stype = "html_auto"
 
-            source = {
+            by_city[slug].append({
                 "_db_id":      row["id"],
                 "name":        row["name"] or row["url"],
                 "url":         row["url"],
                 "source_type": stype,
-                "city_slug":   city_slug,
+                "city_slug":   slug,
                 **extra,
-            }
-            sources_by_city[city_slug].append(source)
+            })
 
-        log.info("Loaded %d dynamic sources from DB", sum(len(v) for v in sources_by_city.values()))
+        total = sum(len(v) for v in by_city.values())
+        log.info("Loaded %d dynamic sources from DB", total)
+
     except Exception as e:
-        log.error("Failed to load dynamic sources from DB: %s", e)
+        log.error("Failed to load dynamic sources: %s", e)
 
-    return sources_by_city
+    return by_city
 
 
 def update_source_stats(db_id: int, event_count: int):
-    """Update last_run and last_count for a source."""
+    """Update last_run and last_count for a scrape source."""
     try:
         conn = _get_conn()
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE wp_openclaw_sources
-            SET last_run = NOW(),
-                last_count = %s
-            WHERE id = %s
-        """, (event_count, db_id))
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE wp_openclaw_sources SET last_run=NOW(), last_count=%s WHERE id=%s",
+                (event_count, db_id)
+            )
         conn.commit()
-        cursor.close()
         conn.close()
     except Exception as e:
         log.error("Failed to update source stats for id %s: %s", db_id, e)
-
-
-# ─── TEC Category Mapping ────────────────────────────────────────────────────
-CATEGORY_KEYWORDS = {
-    "music":       ["concert", "live music", "band", "show", "festival", "dj", "jazz", "blues", "hip hop", "country", "rock", "indie", "rap"],
-    "arts":        ["art", "gallery", "exhibit", "museum", "theatre", "theater", "dance", "opera", "ballet", "film", "cinema", "comedy"],
-    "food-drink":  ["food", "drink", "wine", "beer", "cocktail", "tasting", "dining", "restaurant", "brunch", "happy hour", "bbq"],
-    "sports":      ["game", "match", "tournament", "grizzlies", "hustle", "tigers", "memphis", "nba", "nfl", "mlb", "nhl", "mls", "soccer", "football", "basketball", "baseball"],
-    "fitness":     ["run", "race", "5k", "marathon", "yoga", "cycling", "bike", "hike", "triathlon", "crossfit", "fitness", "workout"],
-    "community":   ["community", "volunteer", "charity", "fundraiser", "neighborhood", "civic", "meeting", "town hall"],
-    "family":      ["family", "kids", "children", "youth", "parent", "toddler", "baby"],
-    "nightlife":   ["nightlife", "club", "bar", "lounge", "karaoke", "trivia", "drag", "dance"],
-    "outdoors":    ["outdoor", "park", "garden", "nature", "trail", "kayak", "canoe", "camping", "fishing"],
-    "business":    ["networking", "conference", "seminar", "workshop", "professional", "startup", "entrepreneur"],
-    "education":   ["lecture", "class", "course", "workshop", "learning", "tour", "talk", "panel"],
-    "holiday":     ["holiday", "christmas", "halloween", "thanksgiving", "new year", "valentine", "easter", "fourth of july"],
-}
-
-# ─── Deduplication ───────────────────────────────────────────────────────────
-DEDUP_FIELDS = ["title", "start_date", "venue_name"]
-
-# ─── Image sideloading ───────────────────────────────────────────────────────
-SIDELOAD_IMAGES = True
-IMAGE_TIMEOUT   = 15
-
-# ─── Ticketmaster filters ────────────────────────────────────────────────────
-TM_SEGMENTS = ["Music", "Arts & Theatre", "Sports", "Family", "Miscellaneous"]
-TM_RADIUS   = "50"
-TM_UNIT     = "miles"
-TM_SIZE     = 200
-TM_AFFILIATE_ID = os.getenv("TM_AFFILIATE_ID", "7097599")
-TM_TO_TLR   = {}
