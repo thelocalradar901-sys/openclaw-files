@@ -49,6 +49,35 @@ def _headers():
     }
 
 
+def _fetch_og_image(ticket_url):
+    """
+    Eventim/See Tickets' Affiliate API provides no image field at all
+    (confirmed against AffiliateEvent schema). Best-effort fallback:
+    fetch the whiteLabelUrl page itself and pull og:image, same pattern
+    as ticketmaster.py's _fetch_ticketweb_image(). Silent failure,
+    returns "" -- never blocks an event from saving.
+    """
+    if not ticket_url:
+        return ""
+    try:
+        import requests as _rq
+        from bs4 import BeautifulSoup
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/126.0.0.0 Safari/537.36"),
+        }
+        resp = _rq.get(ticket_url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tag = soup.find("meta", {"property": "og:image"})
+        if tag and tag.get("content"):
+            return tag["content"]
+    except Exception as e:
+        log.warning("Eventim og:image fetch failed for %s: %s", ticket_url, e)
+    return ""
+
+
 def _get(url, params, retries=3, backoff=2):
     """GET with simple retry/backoff, mirroring ticketmaster.py's _request pattern."""
     for attempt in range(1, retries + 1):
@@ -137,39 +166,129 @@ def filter_events_by_city(events, city_slug):
     return matched
 
 
-def normalize_event(raw_event):
+def normalize_event(raw_event, city_slug):
     """
     Convert a raw AffiliateEvent object into OpenClaw's internal event dict
-    shape (same fields your other scrapers produce before hitting
-    make_fingerprint() / db.py's insert path). Fill in exact field names
-    once we confirm the internal schema you use in scraper.py.
+    shape, following ticketmaster.py's pattern (start_utc/start_local/
+    timezone) rather than the generic _ev() pattern used by html scrapers --
+    because, like TM, Eventim/See Tickets gives us full ISO datetime plus
+    an explicit IANA timezone per event, so we can pre-compute both here
+    instead of making db.py guess from a bare local date string.
+
+    NOTE ON NAMING: this is the official Affiliate API feed, a completely
+    different data path from the existing _scrape_seetickets() in
+    scraper.py (which scrapes individual venue HTML pages on the See
+    Tickets platform as a tertiary source, no affiliate tracking).
+    Deliberately using "eventim" as source_name/external_id prefix here,
+    NOT "seetickets", to avoid confusing the two in logs/DB/fingerprints.
     """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     venue = raw_event.get("venue") or {}
     artist = raw_event.get("mainAct") or {}
 
+    tz_name = raw_event.get("timeZone") or "America/Chicago"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Chicago")
+        tz_name = "America/Chicago"
+
+    def _parse(dt_str):
+        """Returns (utc_str, local_str) in 'YYYY-MM-DD HH:MM:SS', or ("","")."""
+        if not dt_str:
+            return "", ""
+        try:
+            # API examples show offset-style ISO e.g. "2022-08-10T08:14:05+0000"
+            dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
+            dt_utc = dt.astimezone(ZoneInfo("UTC"))
+            dt_local = dt_utc.astimezone(tz)
+            fmt = "%Y-%m-%d %H:%M:%S"
+            return dt_utc.strftime(fmt), dt_local.strftime(fmt)
+        except Exception:
+            log.warning("Eventim: couldn't parse date '%s' for event %s",
+                        dt_str, raw_event.get("id"))
+            return "", ""
+
+    # eventDate is used for single-date events; startDate for multi-date
+    start_utc, start_local = _parse(raw_event.get("eventDate") or raw_event.get("startDate"))
+    end_utc, end_local = _parse(raw_event.get("endDate"))
+    if not end_utc:
+        end_utc, end_local = start_utc, start_local
+
+    if not start_utc and not start_local:
+        return None  # matches ticketmaster.py's "skip unparseable dates" rule
+
+    # ── Price ────────────────────────────────────────────────────────────
+    cost = ""
+    mn = raw_event.get("minTicketPrice")
+    mx = raw_event.get("maxTicketPrice")
+    if mn is not None:
+        cost = f"${mn}-${mx}" if (mx and mx != mn) else f"${mn}"
+
+    # ── Categories (genre + festival/music flags, mirrors TM's classifications) ──
+    categories = []
+    genre = raw_event.get("genre")
+    if genre:
+        categories.append(genre)
+
+    ticket_url = raw_event.get("whiteLabelUrl") or raw_event.get("regularEventUrl") or ""
+    image_url = _fetch_og_image(ticket_url)
+
     return {
-        "source": "eventim",  # or "seetickets" — decide naming convention
-        "external_id": raw_event.get("id"),
-        "title": raw_event.get("title"),
-        "description": raw_event.get("description"),
-        "start_datetime": raw_event.get("eventDate") or raw_event.get("startDate"),
-        "end_datetime": raw_event.get("endDate"),
-        "timezone": raw_event.get("timeZone"),
-        "venue_name": venue.get("name"),
-        "venue_city": venue.get("city"),
-        "venue_state": venue.get("state"),
-        "venue_zip": venue.get("zipcode"),
-        "venue_lat": venue.get("latitude"),
-        "venue_lng": venue.get("longitud"),  # NOTE: API typo is "longitud", not a bug on our end
-        "artist": artist.get("name"),
-        "genre": raw_event.get("genre"),
+        "title": (raw_event.get("title") or "").strip(),
+        "description": (raw_event.get("description") or "").strip(),
+        "start_utc": start_utc,
+        "start_local": start_local,
+        "end_utc": end_utc,
+        "end_local": end_local,
+        "timezone": tz_name,
+        "venue_name": venue.get("name", ""),
+        "venue_address": venue.get("street", ""),
+        "venue_city": venue.get("city", ""),
+        "venue_state": venue.get("state", ""),
+        "venue_zip": venue.get("zipcode", ""),
+        "organizer_name": "",
+        "image_url": image_url,
+        "ticket_url": ticket_url,
+        "cost": cost,
+        "source_name": "Eventim",
+        "city_slug": city_slug,
+        "categories": categories,
         "tags": raw_event.get("tags", []),
-        "affiliate_url": raw_event.get("whiteLabelUrl") or raw_event.get("regularEventUrl"),
-        "min_price": raw_event.get("minTicketPrice"),
-        "max_price": raw_event.get("maxTicketPrice"),
-        "status": raw_event.get("eventStatus"),  # active / cancelled / rescheduled
-        "is_festival": raw_event.get("isFestival", False),
+        "external_id": f"eventim_{raw_event.get('id', '')}",
+        "_needs_enrichment": not raw_event.get("description"),
     }
+
+
+def pull_city(city: dict) -> list[dict]:
+    """
+    Matches ticketmaster.py's pull_city(city) interface so scheduler.py can
+    register this the same way TM is registered. Pulls the full national
+    feed (cheap: ~6.5k events, one API call) then filters to this city.
+
+    NOTE: unlike TM, there's no per-city API call to make -- the whole
+    feed comes back in one shot regardless of city, so if this runs for
+    all 4 cities on the same schedule tick, consider caching the full
+    fetch_all_events() result once per run rather than calling it 4x.
+    """
+    city_slug = city.get("slug", "") if isinstance(city, dict) else str(city)
+    if city_slug not in TLR_CITY_FILTERS:
+        log.warning("Eventim: no city filter configured for slug '%s'", city_slug)
+        return []
+
+    raw_events = fetch_all_events()
+    city_raw = filter_events_by_city(raw_events, city_slug)
+
+    events = []
+    for raw in city_raw:
+        ev = normalize_event(raw, city_slug)
+        if ev:
+            events.append(ev)
+
+    log.info("Eventim pulled %d events for %s", len(events), city.get("name", city_slug))
+    return events
 
 
 if __name__ == "__main__":
@@ -179,3 +298,8 @@ if __name__ == "__main__":
     for slug in TLR_CITY_FILTERS:
         city_events = filter_events_by_city(events, slug)
         log.info(f"  {slug}: {len(city_events)} matching events")
+        # Spot-check the first normalized event so we can see real field
+        # values before wiring into db.py
+        if city_events:
+            sample = normalize_event(city_events[0], slug)
+            log.info(f"    sample normalized event: {sample}")
