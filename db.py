@@ -289,16 +289,36 @@ _PROMO_SUFFIX_PATTERNS = [
 ]
 _PROMO_SUFFIX_RE = re.compile("|".join(_PROMO_SUFFIX_PATTERNS), re.IGNORECASE)
 
+# Eventim/See Tickets appends " – City, ST" (or " - City, ST") to nearly
+# every title, which no other source does. Confirmed 2026-07-07: "Amber
+# Wallin at Growlers – Memphis, TN" (Eventim) vs "Amber Wallin @ Growlers"
+# (venue-direct) only scored 0.72 similarity -- under the 0.80 threshold
+# -- purely because of this suffix, and the prefix-match fallback also
+# missed it since "@" vs "at" broke the word-boundary check. Two separate
+# posts got created for the same show. Stripping the suffix here (comparison
+# key only -- never touches the displayed post_title) fixes this class of
+# miss for any Eventim-vs-other-source pair, not just this one event.
+_CITY_STATE_SUFFIX_RE = re.compile(r"\s*[–—-]\s*[A-Za-z .'\-]+,\s*[A-Z]{2}\s*$")
+_AT_SIGN_RE = re.compile(r"\s@\s")
+
 
 def normalize_title_for_matching(title: str) -> str:
     """
-    Strip known promotional/reseller suffixes before using a title for
+    Strip known promotional/reseller suffixes and Eventim's trailing
+    city/state tag, and normalize "@" to "at", before using a title for
     fingerprinting or fuzzy cross-source matching. NEVER used to set
     the actual displayed post_title -- only to compute a more reliable
     comparison key, so a matched listing still shows whatever the
     source's real title was.
+
+    NOTE: this feeds make_fingerprint() as well as find_cross_source_match().
+    Changing this function changes the fingerprint hash for any existing
+    title matching these patterns -- run a recompute_fingerprints.py pass
+    after deploying, same as any other make_fingerprint()-affecting edit.
     """
     cleaned = _PROMO_SUFFIX_RE.sub("", (title or "").strip())
+    cleaned = _CITY_STATE_SUFFIX_RE.sub("", cleaned)
+    cleaned = _AT_SIGN_RE.sub(" at ", cleaned)
     return cleaned.strip().lower()
 
 
