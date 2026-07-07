@@ -262,6 +262,28 @@ def normalize_event(raw_event, city_slug):
     }
 
 
+def pull_all_cities() -> dict:
+    """
+    Fetches the national feed ONCE, then filters/normalizes per city.
+    Returns {city_slug: [event_dicts]}. This is the entry point scheduler.py
+    should use -- registered as a single job, not one-per-city like TM --
+    since unlike TM there's no per-city API call to make, so doing it
+    per-city would mean 4 redundant full-feed fetches per tick.
+    """
+    raw_events = fetch_all_events()
+    result = {}
+    for city_slug in TLR_CITY_FILTERS:
+        city_raw = filter_events_by_city(raw_events, city_slug)
+        events = []
+        for raw in city_raw:
+            ev = normalize_event(raw, city_slug)
+            if ev:
+                events.append(ev)
+        result[city_slug] = events
+        log.info("Eventim: %d events for %s", len(events), city_slug)
+    return result
+
+
 def pull_city(city: dict) -> list[dict]:
     """
     Matches ticketmaster.py's pull_city(city) interface so scheduler.py can

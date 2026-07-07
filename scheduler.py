@@ -23,7 +23,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import (
-    TICKETMASTER_INTERVAL, SCRAPER_INTERVAL,
+    TICKETMASTER_INTERVAL, SCRAPER_INTERVAL, EVENTIM_INTERVAL,
     load_cities, load_dynamic_sources, update_source_stats,
 )
 
@@ -53,6 +53,20 @@ def start_scheduler() -> BackgroundScheduler:
             replace_existing=True,
             max_instances=1,
         )
+
+    # Eventim/See Tickets Affiliate job -- ONE job total, not one per city.
+    # Unlike TM, Eventim's API returns the whole national feed in a single
+    # call regardless of city, so it's registered once here and handles
+    # all 4 cities internally via pull_all_cities().
+    scheduler.add_job(
+        _run_eventim,
+        trigger=IntervalTrigger(seconds=EVENTIM_INTERVAL),
+        args=[],
+        id="eventim",
+        name="Eventim/See Tickets Affiliate",
+        replace_existing=True,
+        max_instances=1,
+    )
 
     # Scraper jobs
     for city_slug, sources in _sources.items():
@@ -142,6 +156,28 @@ def _run_ticketmaster(city: dict):
         log.info("TM %s: %d inserted, %d skipped", city["name"], inserted, skipped)
     except Exception as e:
         log.error("TM job failed for %s: %s", city["name"], e, exc_info=True)
+
+
+def _run_eventim():
+    from eventim import pull_all_cities
+    from db import insert_event
+    try:
+        events_by_city = pull_all_cities()
+        total_inserted = total_skipped = 0
+        for city_slug, events in events_by_city.items():
+            city = _city_dict(city_slug)
+            inserted = skipped = 0
+            for ev in events:
+                if insert_event(ev, city):
+                    inserted += 1
+                else:
+                    skipped += 1
+            log.info("Eventim %s: %d inserted, %d skipped", city["name"], inserted, skipped)
+            total_inserted += inserted
+            total_skipped += skipped
+        log.info("Eventim total: %d inserted, %d skipped", total_inserted, total_skipped)
+    except Exception as e:
+        log.error("Eventim job failed: %s", e, exc_info=True)
 
 
 def _run_scraper(source: dict, city: dict):
