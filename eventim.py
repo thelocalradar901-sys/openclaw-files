@@ -197,13 +197,24 @@ def normalize_event(raw_event, city_slug):
         tz_name = "America/Chicago"
 
     def _parse(dt_str):
-        """Returns (utc_str, local_str) in 'YYYY-MM-DD HH:MM:SS', or ("","")."""
+        """
+        Returns (utc_str, local_str) in 'YYYY-MM-DD HH:MM:SS', or ("","").
+
+        NOTE: the OpenAPI spec's example format is "2022-08-10T08:14:05+0000"
+        (no milliseconds, numeric offset) -- but real production data comes
+        back as "2026-08-09T19:00:00.000Z" (milliseconds + literal Z suffix),
+        which %z-based strptime cannot parse (confirmed in production logs
+        2026-07-07: every single event failed to parse against the spec's
+        format). Using fromisoformat() with a Z->+00:00 swap instead, same
+        pattern ticketmaster.py already uses for its own date parsing --
+        this handles both the spec's documented format AND the real one.
+        """
         if not dt_str:
             return "", ""
         try:
-            # API examples show offset-style ISO e.g. "2022-08-10T08:14:05+0000"
-            dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z")
-            dt_utc = dt.astimezone(ZoneInfo("UTC"))
+            from zoneinfo import ZoneInfo as _ZI
+            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            dt_utc = dt.astimezone(_ZI("UTC"))
             dt_local = dt_utc.astimezone(tz)
             fmt = "%Y-%m-%d %H:%M:%S"
             return dt_utc.strftime(fmt), dt_local.strftime(fmt)
