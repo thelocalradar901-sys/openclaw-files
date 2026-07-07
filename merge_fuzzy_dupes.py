@@ -36,6 +36,28 @@ import re
 _NUMBERED_OCCURRENCE_RE = re.compile(
     r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
 )
+
+_LINEUP_SHOW_RE = re.compile(
+    r"\b(?:featuring|feat\.|lineup)\b", re.IGNORECASE
+)
+
+def _is_lineup_show(title: str) -> bool:
+    """
+    True if a title looks like a multi-performer showcase/lineup listing
+    (contains "featuring", "feat.", or "lineup"). These recurring-series
+    shows (songwriter rounds, tribute nights, cabaret nights) share so
+    much generic boilerplate across genuinely DIFFERENT real shows that
+    no similarity-ratio or prefix-comparison heuristic reliably tells
+    them apart -- confirmed 2026-07-07: "Gay Ole Opry Presents: Lilith
+    Feral lineup TBA" (a cabaret night) scored 0.82 against BOTH
+    "BACKSTAGE NASHVILLE! ... featuring Aaron Raitiere..." (a songwriter
+    showcase) and "The Long Players performing Fleetwood Mac's
+    'Rumours' featuring Todd Sharp..." (a tribute band) -- three
+    unrelated shows. Rather than chase an ever-more-specific heuristic,
+    ANY pair where either side is a lineup-style show is pulled out of
+    auto-merge entirely and flagged for manual review instead.
+    """
+    return bool(_LINEUP_SHOW_RE.search(title or ""))
 from collections import defaultdict
 from db import (
     normalize_title_for_matching, _is_headliner_prefix_match,
@@ -130,6 +152,9 @@ def find_pairs(conn):
                 # one side is itself a sign these are different listings.
                 if _NUMBERED_OCCURRENCE_RE.search(a["post_title"] or "") or \
                    _NUMBERED_OCCURRENCE_RE.search(b["post_title"] or ""):
+                    continue
+
+                if _is_lineup_show(a["post_title"] or "") or _is_lineup_show(b["post_title"] or ""):
                     continue
 
                 ratio = difflib.SequenceMatcher(None, a["_norm_title"], b["_norm_title"]).ratio()
