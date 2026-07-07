@@ -92,6 +92,24 @@ def find_pairs(conn):
                 a, b = posts[i], posts[j]
                 if a["_fp"] == b["_fp"]:
                     continue
+                # Fixture/matchup guard: titles like "Team A vs Team B" must
+                # never be fuzzy-matched against each other. Confirmed
+                # 2026-07-07: "Liverpool FC vs Sunderland" scored 0.86
+                # against "Birmingham Legion FC vs Brooklyn FC" -- two
+                # completely unrelated real-world games -- because shared
+                # boilerplate ("FC", "vs", "Womens Volleyball") inflates
+                # character-overlap similarity regardless of which teams
+                # are actually playing. Also caught same-tournament
+                # different-opponent pairs (Buffs Classic vs Central
+                # Arkansas vs. vs Denver Pioneers). Fixture titles are
+                # only ever safe to treat as the same event via the EXACT
+                # fingerprint path (make_fingerprint()), never via fuzzy
+                # similarity here.
+                a_is_fixture = " vs " in f' {a["_norm_title"]} '
+                b_is_fixture = " vs " in f' {b["_norm_title"]} '
+                if a_is_fixture or b_is_fixture:
+                    continue
+
                 ratio = difflib.SequenceMatcher(None, a["_norm_title"], b["_norm_title"]).ratio()
                 is_prefix = (_is_headliner_prefix_match(a["_norm_title"], b["_norm_title"]) or
                              _is_headliner_prefix_match(b["_norm_title"], a["_norm_title"]))
