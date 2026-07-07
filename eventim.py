@@ -246,7 +246,16 @@ def normalize_event(raw_event, city_slug):
         categories.append(genre)
 
     ticket_url = raw_event.get("whiteLabelUrl") or raw_event.get("regularEventUrl") or ""
-    image_url = _fetch_og_image(ticket_url)
+
+    # NOTE: og:image fetch disabled as of 2026-07-07 -- confirmed in
+    # production that wl.eventim.us returns 403 Forbidden on every single
+    # request (bot/scraper protection), 100% failure rate across 382 real
+    # events tested. Was adding ~4-5 minutes of dead weight per Eventim
+    # cycle for zero benefit. _fetch_og_image() is left defined above in
+    # case a workaround (different headers, Playwright rendering, etc.)
+    # is worth revisiting later -- see Larimer Lounge for a similar
+    # accepted JS/bot-protection limitation elsewhere in OpenClaw.
+    image_url = ""
 
     return {
         "title": (raw_event.get("title") or "").strip(),
