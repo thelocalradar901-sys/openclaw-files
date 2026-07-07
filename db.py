@@ -978,23 +978,39 @@ def update_event(conn, post_id: int, event: dict, city_config: dict = None) -> b
                 "_EventAllDay":       t["all_day"],
                 "_EventTimezone":     t["timezone"],
             }
-        ticket_url        = (event.get("ticket_url") or "").strip()
-        incoming_is_tm     = (event.get("source_name") or "").strip().lower() == "ticketmaster"
+        ticket_url = (event.get("ticket_url") or "").strip()
+        incoming_source = (event.get("source_name") or "").strip().lower()
+
+        # ── Affiliate link priority ─────────────────────────────────────────
+        # Generalized from the original TM-only check. Order = priority,
+        # first wins. Each source has a URL "marker" -- a substring that
+        # reliably identifies a link as already belonging to that source,
+        # checked directly against the URL string (not against
+        # _openclaw_source metadata, which reflects whichever source last
+        # touched other post fields, not which source set the link).
+        #
+        # NOTE: TM > Eventim ordering here is a placeholder matching the
+        # pre-existing behavior (TM always won before Eventim existed).
+        # Confirm with Blake whether commission economics justify a
+        # different order once real numbers are in from both feeds.
+        #
+        # NOTE ALSO: Eventim's marker checks for the seetickets.us domain,
+        # NOT a query-string affiliate id like TM's aaid= -- because it's
+        # still unconfirmed whether whiteLabelUrl carries affId attribution
+        # automatically or needs one appended. If it turns out an explicit
+        # tracking param is required, add it in eventim.py's ticket_url
+        # construction (mirroring TM's &aaid= append) -- this marker check
+        # here will keep working either way since it's domain-based.
+        AFFILIATE_PRIORITY = ["ticketmaster", "eventim"]
+        AFFILIATE_MARKERS = {
+            "ticketmaster": lambda u: "aaid=" in u,
+            "eventim":      lambda u: "seetickets.us" in u,
+        }
+
         if ticket_url and not keep_existing_time:
-            if incoming_is_tm:
-                # Ticketmaster always wins the ticket link -- it carries
-                # the affiliate ID (aaid=7097599), so this is the one
-                # field where source matters more than "most recent
-                # scrape wins."
-                time_meta["_EventURL"] = ticket_url
-            else:
-                # Non-TM source: only set the link if there ISN'T
-                # already a Ticketmaster affiliate link saved. Checking
-                # the URL string directly (rather than trusting
-                # _openclaw_source, which reflects whichever source
-                # last wrote post meta, not which source set the link)
-                # means this is correct even if a non-TM source updated
-                # other fields on this post more recently.
+            if incoming_source in AFFILIATE_PRIORITY:
+                incoming_rank = AFFILIATE_PRIORITY.index(incoming_source)
+
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT meta_value FROM {WP_PREFIX}postmeta "
@@ -1003,7 +1019,30 @@ def update_event(conn, post_id: int, event: dict, city_config: dict = None) -> b
                     )
                     row = cur.fetchone()
                 existing_url = (row["meta_value"] if row else "") or ""
-                if "aaid=" not in existing_url:
+
+                existing_rank = None
+                for i, src in enumerate(AFFILIATE_PRIORITY):
+                    if AFFILIATE_MARKERS[src](existing_url):
+                        existing_rank = i
+                        break
+
+                # No known affiliate link yet, or incoming source outranks
+                # (or matches) whichever affiliate currently holds the link.
+                if existing_rank is None or incoming_rank <= existing_rank:
+                    time_meta["_EventURL"] = ticket_url
+            else:
+                # Non-affiliate source (venue-direct, JSON-LD, etc.): only
+                # set the link if there ISN'T already a known affiliate
+                # link saved (TM or Eventim), same spirit as before.
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT meta_value FROM {WP_PREFIX}postmeta "
+                        f"WHERE post_id=%s AND meta_key='_EventURL' LIMIT 1",
+                        (post_id,)
+                    )
+                    row = cur.fetchone()
+                existing_url = (row["meta_value"] if row else "") or ""
+                if not any(AFFILIATE_MARKERS[src](existing_url) for src in AFFILIATE_PRIORITY):
                     time_meta["_EventURL"] = ticket_url
 
         with conn.cursor() as cur:
