@@ -20,7 +20,7 @@ _NUMBERED_OCCURRENCE_RE = re.compile(
 )
 
 _LINEUP_SHOW_RE = re.compile(
-    r"\b(?:featuring|feat\.|lineup)\b", re.IGNORECASE
+    r"\bfeaturing\b|\bfeat\.|\blineup\b", re.IGNORECASE
 )
 
 def _is_lineup_show(title: str) -> bool:
