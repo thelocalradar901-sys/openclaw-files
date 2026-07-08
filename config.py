@@ -60,6 +60,17 @@ EVENTIM_INTERVAL      = int(os.getenv("EVENTIM_INTERVAL", 3600))
 SIDELOAD_IMAGES = True
 IMAGE_TIMEOUT   = 15
 
+# ── TicketWeb image relay ─────────────────────────────────────────────────────
+# TicketWeb's WAF blocks the Hetzner VPS's IP/ASN outright -- requests still
+# get a 200, but the body is a bot-check/interstitial page with no
+# twitter:image/og:image tag, so no amount of header/UA tuning on THIS box
+# fixes it (confirmed 2026-07-02/2026-07-08). TICKETWEB_IMAGE_PROXY_URL,
+# if set, points at a small relay (e.g. a Cloudflare Worker) running on a
+# different IP range that fetches the TicketWeb page and returns just the
+# image URL as plain text. Left unset by default -- ticketmaster.py falls
+# back to a direct fetch from this box when it's empty, same as before.
+TICKETWEB_IMAGE_PROXY_URL = os.getenv("TICKETWEB_IMAGE_PROXY_URL", "")
+
 # ── Static city fallback (used only if DB is unreachable) ─────────────────────
 CITIES = [
     {"name": "Memphis",    "slug": "memphis",    "ticketmaster_dma_id": "322", "lat": 35.1495, "lng": -90.0490, "radius_miles": 35},

@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 
 from config import (
     TICKETMASTER_API_KEY, TM_SEGMENTS, TM_RADIUS,
-    TM_UNIT, TM_SIZE, TM_AFFILIATE_ID,
+    TM_UNIT, TM_SIZE, TM_AFFILIATE_ID, TICKETWEB_IMAGE_PROXY_URL,
 )
 
 log = logging.getLogger("openclaw.ticketmaster")
@@ -195,9 +195,29 @@ def _fetch_ticketweb_image(ticketweb_url: str) -> str:
     TicketWeb pages simply don't set og:image at all). Best-effort
     fetch; failure is always silent and returns "" so it never blocks
     an event from saving with whatever image TM already provided.
+
+    TicketWeb's WAF blocks the Hetzner VPS's IP/ASN outright -- direct
+    requests from this box get a 200 back but the body is a bot-check/
+    interstitial page with no image meta tag at all (confirmed
+    2026-07-08), so header/UA tuning alone can't fix it. If
+    TICKETWEB_IMAGE_PROXY_URL is configured (a small relay running on a
+    different IP range -- see TICKETWEB_IMAGE_PROXY_URL in config.py),
+    try that FIRST since it's far more likely to actually reach the
+    real page. Direct fetch from this box is kept as a fallback -- both
+    for when the proxy isn't configured, and in case the proxy itself
+    is down/rate-limited on a given call.
     """
     if not ticketweb_url:
         return ""
+
+    if TICKETWEB_IMAGE_PROXY_URL:
+        proxied = _fetch_ticketweb_image_via_proxy(ticketweb_url)
+        if proxied:
+            log.info("TicketWeb image via RELAY for %s", ticketweb_url)
+            return proxied
+        log.debug("TicketWeb proxy fetch came up empty for %s -- falling back to direct fetch",
+                   ticketweb_url)
+
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -213,6 +233,7 @@ def _fetch_ticketweb_image(ticketweb_url: str) -> str:
         tag = (soup.find("meta", {"name": "twitter:image"}) or
                soup.find("meta", {"property": "og:image"}))
         if tag and tag.get("content"):
+            log.info("TicketWeb image via DIRECT fetch for %s", ticketweb_url)
             return tag["content"]
         else:
             log.warning("TicketWeb page fetched OK but no image meta tag found for %s "
@@ -220,6 +241,41 @@ def _fetch_ticketweb_image(ticketweb_url: str) -> str:
                         ticketweb_url, resp.status_code, len(resp.text))
     except Exception as e:
         log.warning("TicketWeb image fetch failed for %s: %s", ticketweb_url, e)
+    return ""
+
+
+def _fetch_ticketweb_image_via_proxy(ticketweb_url: str) -> str:
+    """
+    Ask the relay (TICKETWEB_IMAGE_PROXY_URL) to fetch ticketweb_url from
+    its own IP and hand back just the image URL as a plain-text body
+    (empty body / non-200 = "not found", handled the same as any other
+    miss). Never raises -- any failure here just means the caller falls
+    through to the direct-fetch path.
+    """
+    try:
+        resp = requests.get(
+            TICKETWEB_IMAGE_PROXY_URL,
+            params={"url": ticketweb_url},
+            timeout=15,
+        )
+        if resp.status_code == 403:
+            log.warning("TicketWeb proxy returned 403 (bad/missing key?) for %s", ticketweb_url)
+            return ""
+        if resp.status_code == 400:
+            log.warning("TicketWeb proxy rejected URL as invalid for %s", ticketweb_url)
+            return ""
+        if resp.status_code == 204:
+            log.debug("TicketWeb proxy fetched the page OK but found no image tag for %s",
+                      ticketweb_url)
+            return ""
+        resp.raise_for_status()
+        image_url = resp.text.strip()
+        if image_url and image_url.startswith("http"):
+            return image_url
+        log.debug("TicketWeb proxy returned an unexpected body for %s: %r",
+                  ticketweb_url, image_url[:120])
+    except Exception as e:
+        log.warning("TicketWeb proxy fetch failed for %s: %s", ticketweb_url, e)
     return ""
 
 

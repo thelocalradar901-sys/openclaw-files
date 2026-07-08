@@ -1235,162 +1235,220 @@ def insert_event(event: dict, city_config: dict = None) -> bool:
         if existing_id:
             return update_event(conn, existing_id, event, city_config)
 
-        # No exact fingerprint match -- before assuming this is a brand
-        # new event, check whether a DIFFERENT source already created a
-        # post for the same real-world event under a slightly different
-        # title string (see find_cross_source_match() docstring). This
-        # is what lets e.g. a Ticketmaster pull recognize a venue
-        # source's "Birmingham Legion FC vs Brooklyn FC" as the same
-        # match as TM's own "Birmingham Legion FC vs. Brooklyn FC"
-        # instead of creating a second post for it.
-        cross_match_id = find_cross_source_match(conn, event, t)
-        if cross_match_id:
-            updated = update_event(conn, cross_match_id, event, city_config)
-            if updated:
-                # Backfill THIS event's exact fingerprint onto the
-                # matched post too, so the next time this exact source
-                # re-scrapes this exact title, it hits the fast exact
-                # lookup above instead of re-running the fuzzy search.
-                # Use INSERT IGNORE -- if another worker is concurrently
-                # claiming this same fp for a brand-new post, let that
-                # claim win; we don't want two fp rows pointing at
-                # different posts.
+        # RACE GUARD (added 2026-07-08): two DIFFERENT titles for the
+        # same real-world event -- e.g. two Ticketmaster/TicketWeb
+        # listings for the same show, "Addie Levy" vs "Addie Levy w/
+        # Solo Lowit" -- hash to two different fingerprints, so the
+        # exact-match check above can't catch them; only
+        # find_cross_source_match() below can, via title similarity.
+        # Unlike the fingerprint claim further down (protected by a
+        # UNIQUE constraint), the fuzzy cross-source check is a plain
+        # SELECT with no locking -- so two workers processing
+        # near-simultaneous pulls for the same (city, date) can BOTH
+        # run their SELECT before either one has committed a post, both
+        # come up empty, and both go on to create a duplicate post.
+        # Confirmed 2026-07-08 with two same-day TM/TicketWeb pulls for
+        # The Basement (Nashville).
+        #
+        # Fix: serialize the "no exact match -> check fuzzy match ->
+        # decide insert-or-update" section per (city_slug, canonical
+        # date) with a MySQL advisory lock, so only one worker at a
+        # time can be mid-decision for a given city+day. Coarse-grained
+        # (locks out every event on that city+day, not just the
+        # specific colliding pair), but scrape volume per city/day is
+        # low enough for that to cost nothing measurable, and it closes
+        # the race at the source instead of relying on
+        # merge_fuzzy_dupes.py to mop up afterward.
+        canonical_date = (t.get("start_utc") or t.get("start_local") or "").strip()[:10]
+        city_slug_norm = (event.get("city_slug") or "").strip().lower()
+        lock_key  = f"openclaw_dedup:{city_slug_norm}:{canonical_date}"
+        lock_held = False
+        if canonical_date and city_slug_norm:
+            with conn.cursor() as cur:
+                cur.execute("SELECT GET_LOCK(%s, 10) AS locked", (lock_key,))
+                row = cur.fetchone()
+                lock_held = bool(row and row.get("locked"))
+            if not lock_held:
+                log.warning(
+                    "Dedup lock timeout for '%s' (city=%s date=%s) -- "
+                    "proceeding without lock, rely on merge_fuzzy_dupes.py cleanup",
+                    lock_key, city_slug_norm, canonical_date
+                )
+
+        try:
+            # No exact fingerprint match -- before assuming this is a brand
+            # new event, check whether a DIFFERENT source already created a
+            # post for the same real-world event under a slightly different
+            # title string (see find_cross_source_match() docstring). This
+            # is what lets e.g. a Ticketmaster pull recognize a venue
+            # source's "Birmingham Legion FC vs Brooklyn FC" as the same
+            # match as TM's own "Birmingham Legion FC vs. Brooklyn FC"
+            # instead of creating a second post for it.
+            cross_match_id = find_cross_source_match(conn, event, t)
+            if cross_match_id:
+                updated = update_event(conn, cross_match_id, event, city_config)
+                if updated:
+                    # Backfill THIS event's exact fingerprint onto the
+                    # matched post too, so the next time this exact source
+                    # re-scrapes this exact title, it hits the fast exact
+                    # lookup above instead of re-running the fuzzy search.
+                    # Use INSERT IGNORE -- if another worker is concurrently
+                    # claiming this same fp for a brand-new post, let that
+                    # claim win; we don't want two fp rows pointing at
+                    # different posts.
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"INSERT IGNORE INTO {WP_PREFIX}openclaw_fingerprints (fp, post_id, created) "
+                            f"VALUES (%s, %s, %s)",
+                            (fp, cross_match_id, now)
+                        )
+                    conn.commit()
+                return updated
+
+            # Claim the fingerprint atomically. Reserve post_id=0 as a
+            # placeholder row while we build the real post below, then
+            # update it to the real post_id once we have one. The UNIQUE
+            # constraint on fp is what actually prevents the race -- only
+            # one worker's INSERT here can ever succeed for a given fp.
+            try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"INSERT IGNORE INTO {WP_PREFIX}openclaw_fingerprints (fp, post_id, created) "
-                        f"VALUES (%s, %s, %s)",
-                        (fp, cross_match_id, now)
+                        f"INSERT INTO {WP_PREFIX}openclaw_fingerprints (fp, post_id, created) "
+                        f"VALUES (%s, 0, %s)",
+                        (fp, now)
                     )
                 conn.commit()
-            return updated
+            except pymysql.err.IntegrityError:
+                # Lost the race -- another worker claimed this fingerprint
+                # between our get_fingerprint_post_id() check and now.
+                # Roll back our half-open transaction, then find and update
+                # whichever post the winner created.
+                conn.rollback()
 
-        # Claim the fingerprint atomically. Reserve post_id=0 as a
-        # placeholder row while we build the real post below, then
-        # update it to the real post_id once we have one. The UNIQUE
-        # constraint on fp is what actually prevents the race -- only
-        # one worker's INSERT here can ever succeed for a given fp.
-        try:
+                # IMPORTANT: from here on, use a FRESH connection for every
+                # lookup attempt instead of reusing `conn`. `conn`'s
+                # transaction snapshot was established back at the
+                # existence check above (REPEATABLE READ) and will never
+                # see the winner's commit no matter how many times or how
+                # long it retried. Every race
+                # was guaranteed to "time out" and skip that cycle (logged as
+                # "Fingerprint claim race unresolved"), and on a LATER scrape cycle
+                # (a fresh connection/transaction with a fresh snapshot), the
+                # existence check at the top could itself lose a fresh race and
+                # repeat the same dance -- occasionally landing on a true duplicate
+                # post hours after the original race, which is what was still
+                # happening even after the post_id-backfill-timing fix earlier today.
+                for attempt in range(25):
+                    lookup_conn = get_connection()
+                    try:
+                        winner_id = get_fingerprint_post_id(lookup_conn, fp)
+                    finally:
+                        lookup_conn.close()
+                    if winner_id and winner_id != 0:
+                        # Use a fresh connection for the update too, rather
+                        # than the original `conn` whose snapshot may also
+                        # be stale for the post's own row state.
+                        update_conn = get_connection()
+                        try:
+                            return update_event(update_conn, winner_id, event, city_config)
+                        finally:
+                            update_conn.close()
+                    time.sleep(0.2)
+                log.warning("Fingerprint claim race unresolved for '%s' -- skipping this cycle", event.get("title"))
+                return False
+
+            # New insert — we now hold the only claim on this fingerprint.
+            title   = _clean_title((event.get("title") or "Untitled Event").strip())
+            content = (event.get("description") or "").strip()
+            slug    = unique_post_slug(conn, slugify(title))
+
+            with conn.cursor() as cur:
+                # Insert as 'draft' first — we'll flip to 'publish' after all meta and
+                # TEC index rows are written. This triggers TEC's own save hooks on the
+                # status transition, which is what makes events appear without a manual Update.
+                cur.execute(
+                    f"INSERT INTO {WP_PREFIX}posts "
+                    f"(post_author,post_date,post_date_gmt,post_content,post_excerpt,post_title,"
+                    f"post_status,comment_status,ping_status,post_name,"
+                    f"post_modified,post_modified_gmt,post_type,"
+                    f"to_ping,pinged,post_content_filtered) "
+                    f"VALUES (1,%s,%s,%s,'',%s,'draft','closed','closed',%s,%s,%s,"
+                    f"'tribe_events','','','')",
+                    (now, now, content, title, slug, now, now)
+                )
+                post_id = cur.lastrowid
+
+                # Fill in the real post_id on our fingerprint claim row right
+                # away -- BEFORE the slower category/image/TEC-index writes
+                # below. A racing second worker's wait-and-retry loop (above)
+                # polls this row, so the sooner it's filled in, the sooner
+                # that worker finds it instead of timing out and skipping.
+                cur.execute(
+                    f"UPDATE {WP_PREFIX}openclaw_fingerprints SET post_id=%s WHERE fp=%s",
+                    (post_id, fp)
+                )
+                conn.commit()
+
+                meta = [
+                    (post_id, "_EventStartDate",       t["start_local"]),
+                    (post_id, "_EventEndDate",          t["end_local"]),
+                    (post_id, "_EventStartDateUTC",     t["start_utc"]),
+                    (post_id, "_EventEndDateUTC",       t["end_utc"]),
+                    (post_id, "_EventAllDay",           t["all_day"]),
+                    (post_id, "_EventTimezone",         t["timezone"]),
+                    (post_id, "_EventCurrencySymbol",   "$"),
+                    (post_id, "_EventCurrencyPosition", "prefix"),
+                    (post_id, "_EventCost",             event.get("cost") or ""),
+                    (post_id, "_EventDescription",      content),
+                    (post_id, "_EventURL",              event.get("ticket_url") or ""),
+                    (post_id, "_openclaw_fp",           fp),
+                    (post_id, "_openclaw_source",       event.get("source_name") or ""),
+                    (post_id, "_openclaw_city",         event.get("city_slug") or ""),
+                    (post_id, "_openclaw_external_id",  event.get("external_id") or ""),
+                ]
+
+                vid = _get_or_create_venue(conn, event)
+                if vid:
+                    meta.append((post_id, "_EventVenueID", vid))
+
+                if event.get("organizer_name"):
+                    oid = _get_or_create_organizer(conn, event["organizer_name"])
+                    if oid:
+                        meta.append((post_id, "_EventOrganizerID", oid))
+
+                cur.executemany(
+                    f"INSERT INTO {WP_PREFIX}postmeta (post_id,meta_key,meta_value) "
+                    f"VALUES (%s,%s,%s)",
+                    meta
+                )
+
+            _apply_categories(conn, post_id, event, city_config)
+            _apply_image(conn, post_id, event.get("image_url", ""), title)
+            _write_tec_index(conn, post_id, t)
+
+            # Flip from draft → publish now that all meta and TEC index are ready
             with conn.cursor() as cur:
                 cur.execute(
-                    f"INSERT INTO {WP_PREFIX}openclaw_fingerprints (fp, post_id, created) "
-                    f"VALUES (%s, 0, %s)",
-                    (fp, now)
+                    f"UPDATE {WP_PREFIX}posts SET post_status='publish', "
+                    f"post_modified=%s, post_modified_gmt=%s WHERE ID=%s",
+                    (now, now, post_id)
                 )
-            conn.commit()
-        except pymysql.err.IntegrityError:
-            # Lost the race -- another worker claimed this fingerprint
-            # between our get_fingerprint_post_id() check and now.
-            # Roll back our half-open transaction, then find and update
-            # whichever post the winner created.
-            conn.rollback()
 
-            # IMPORTANT: from here on, use a FRESH connection for every
-            # lookup attempt instead of reusing `conn`. `conn`'s
-            # transaction snapshot was established back at the
-            # existence check above (REPEATABLE READ) and will never
-            # see the winner's commit no matter how many times we
-            # query it on this same connection. A new connection means
-            # a new snapshot taken at query time, which can see
-            # anything already committed by another thread.
-            for attempt in range(25):
-                lookup_conn = get_connection()
+            conn.commit()
+            log.info("Inserted [%d] '%s' (%s)", post_id, title, event.get("city_slug"))
+            return True
+        finally:
+            # Release the dedup advisory lock acquired above, regardless
+            # of which return path was taken (cross-match update, race
+            # retry, or fresh insert). Safe to call even if we never
+            # held it -- RELEASE_LOCK on an unheld/unknown name is a
+            # harmless no-op in MySQL.
+            if lock_held:
                 try:
-                    winner_id = get_fingerprint_post_id(lookup_conn, fp)
-                finally:
-                    lookup_conn.close()
-                if winner_id and winner_id != 0:
-                    # Use a fresh connection for the update too, rather
-                    # than the original `conn` whose snapshot may also
-                    # be stale for the post's own row state.
-                    update_conn = get_connection()
-                    try:
-                        return update_event(update_conn, winner_id, event, city_config)
-                    finally:
-                        update_conn.close()
-                time.sleep(0.2)
-            log.warning("Fingerprint claim race unresolved for '%s' -- skipping this cycle", event.get("title"))
-            return False
-
-        # New insert — we now hold the only claim on this fingerprint.
-        title   = _clean_title((event.get("title") or "Untitled Event").strip())
-        content = (event.get("description") or "").strip()
-        slug    = unique_post_slug(conn, slugify(title))
-
-        with conn.cursor() as cur:
-            # Insert as 'draft' first — we'll flip to 'publish' after all meta and
-            # TEC index rows are written. This triggers TEC's own save hooks on the
-            # status transition, which is what makes events appear without a manual Update.
-            cur.execute(
-                f"INSERT INTO {WP_PREFIX}posts "
-                f"(post_author,post_date,post_date_gmt,post_content,post_excerpt,post_title,"
-                f"post_status,comment_status,ping_status,post_name,"
-                f"post_modified,post_modified_gmt,post_type,"
-                f"to_ping,pinged,post_content_filtered) "
-                f"VALUES (1,%s,%s,%s,'',%s,'draft','closed','closed',%s,%s,%s,"
-                f"'tribe_events','','','')",
-                (now, now, content, title, slug, now, now)
-            )
-            post_id = cur.lastrowid
-
-            # Fill in the real post_id on our fingerprint claim row right
-            # away -- BEFORE the slower category/image/TEC-index writes
-            # below. A racing second worker's wait-and-retry loop (above)
-            # polls this row, so the sooner it's filled in, the sooner
-            # that worker finds it instead of timing out and skipping.
-            cur.execute(
-                f"UPDATE {WP_PREFIX}openclaw_fingerprints SET post_id=%s WHERE fp=%s",
-                (post_id, fp)
-            )
-            conn.commit()
-
-            meta = [
-                (post_id, "_EventStartDate",       t["start_local"]),
-                (post_id, "_EventEndDate",          t["end_local"]),
-                (post_id, "_EventStartDateUTC",     t["start_utc"]),
-                (post_id, "_EventEndDateUTC",       t["end_utc"]),
-                (post_id, "_EventAllDay",           t["all_day"]),
-                (post_id, "_EventTimezone",         t["timezone"]),
-                (post_id, "_EventCurrencySymbol",   "$"),
-                (post_id, "_EventCurrencyPosition", "prefix"),
-                (post_id, "_EventCost",             event.get("cost") or ""),
-                (post_id, "_EventDescription",      content),
-                (post_id, "_EventURL",              event.get("ticket_url") or ""),
-                (post_id, "_openclaw_fp",           fp),
-                (post_id, "_openclaw_source",       event.get("source_name") or ""),
-                (post_id, "_openclaw_city",         event.get("city_slug") or ""),
-                (post_id, "_openclaw_external_id",  event.get("external_id") or ""),
-            ]
-
-            vid = _get_or_create_venue(conn, event)
-            if vid:
-                meta.append((post_id, "_EventVenueID", vid))
-
-            if event.get("organizer_name"):
-                oid = _get_or_create_organizer(conn, event["organizer_name"])
-                if oid:
-                    meta.append((post_id, "_EventOrganizerID", oid))
-
-            cur.executemany(
-                f"INSERT INTO {WP_PREFIX}postmeta (post_id,meta_key,meta_value) "
-                f"VALUES (%s,%s,%s)",
-                meta
-            )
-
-        _apply_categories(conn, post_id, event, city_config)
-        _apply_image(conn, post_id, event.get("image_url", ""), title)
-        _write_tec_index(conn, post_id, t)
-
-        # Flip from draft → publish now that all meta and TEC index are ready
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE {WP_PREFIX}posts SET post_status='publish', "
-                f"post_modified=%s, post_modified_gmt=%s WHERE ID=%s",
-                (now, now, post_id)
-            )
-
-        conn.commit()
-        log.info("Inserted [%d] '%s' (%s)", post_id, title, event.get("city_slug"))
-        return True
+                    with conn.cursor() as rel_cur:
+                        rel_cur.execute("SELECT RELEASE_LOCK(%s)", (lock_key,))
+                except Exception:
+                    pass
 
     except Exception as e:
         try:
