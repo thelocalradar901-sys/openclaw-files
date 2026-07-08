@@ -1,210 +1,159 @@
 """
-scheduler.py — APScheduler job coordinator
+scheduler.py – OpenClaw APScheduler job coordinator
 
 Jobs:
-  - Ticketmaster: one per city, every TICKETMASTER_INTERVAL seconds (default 1h)
-  - Scraper:      one per source, every SCRAPER_INTERVAL seconds (default 2h)
-  - DB refresh:   every hour — picks up new cities/sources without daemon restart
-  - Discovery:    one per city, every DISCOVERY_INTERVAL seconds (default 7 days).
-                  Finds new candidate event sources via OSM Overpass and adds
-                  them to wp_openclaw_sources as status='probation'. Does NOT
-                  fire immediately on startup (see _fire_all) since a single
-                  run can take ~30-40 minutes -- we don't want every daemon
-                  restart kicking off a long discovery run.
+  - Ticketmaster pull: every TICKETMASTER_INTERVAL seconds (default 1h), one job per city
+  - Scraper run:       every SCRAPER_INTERVAL seconds (default 2h), one job per source
+  - City/source refresh: every 1h, reloads from DB so new cities/sources take effect
+    without restarting the daemon
 
-All jobs run immediately on startup, then on their interval -- EXCEPT
-discovery jobs, which only ever run on their normal weekly interval.
+All jobs are fire-and-forget. Errors are caught and logged; the scheduler
+continues regardless.
 """
 
 import logging
-from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from config import (
-    TICKETMASTER_INTERVAL, SCRAPER_INTERVAL, EVENTIM_INTERVAL,
-    load_cities, load_dynamic_sources, update_source_stats,
-)
-
-DISCOVERY_INTERVAL = 7 * 24 * 3600  # weekly
+from config import TICKETMASTER_INTERVAL, SCRAPER_INTERVAL, load_cities, load_dynamic_sources, update_source_stats
 
 log = logging.getLogger("openclaw.scheduler")
 
+# Module-level state so the refresh job can update it
 _cities  = []
-_sources = {}
+_sources = {}   # { city_slug: [source_dict, ...] }
 
 
 def start_scheduler() -> BackgroundScheduler:
+    """Build and start the APScheduler. Returns the running scheduler."""
     global _cities, _sources
     _cities  = load_cities()
     _sources = load_dynamic_sources()
 
     scheduler = BackgroundScheduler(timezone="UTC")
 
-    # Ticketmaster jobs
+    # ── Ticketmaster jobs ─────────────────────────────────────────────────────
     for city in _cities:
         scheduler.add_job(
             _run_ticketmaster,
             trigger=IntervalTrigger(seconds=TICKETMASTER_INTERVAL),
             args=[city],
             id=f"tm_{city['slug']}",
-            name=f"Ticketmaster – {city['name']}",
+            name=f"Ticketmaster - {city['name']}",
             replace_existing=True,
             max_instances=1,
+            # APScheduler's default misfire_grace_time is 1 second -- if
+            # more than 1s passes between a job's scheduled run time and
+            # the executor actually getting to it, APScheduler silently
+            # SKIPS the run entirely (logged only as a WARNING, easy to
+            # miss). Confirmed 2026-07-08: every TM job for all 4 cities
+            # missed its immediate on-startup fire this way -- with
+            # dozens of jobs (4 TM + every scraper + Eventim) all queued
+            # at once on restart, the thread pool routinely takes more
+            # than 1s to reach each one. 300s of slack costs nothing
+            # (a TM pull running up to 5 minutes "late" is irrelevant at
+            # a 1-hour interval) and stops this class of silent no-op.
+            misfire_grace_time=300,
         )
+        log.info("Scheduled Ticketmaster job for %s (every %ds)", city["name"], TICKETMASTER_INTERVAL)
 
-    # Eventim/See Tickets Affiliate job -- ONE job total, not one per city.
-    # Unlike TM, Eventim's API returns the whole national feed in a single
-    # call regardless of city, so it's registered once here and handles
-    # all 4 cities internally via pull_all_cities().
-    scheduler.add_job(
-        _run_eventim,
-        trigger=IntervalTrigger(seconds=EVENTIM_INTERVAL),
-        args=[],
-        id="eventim",
-        name="Eventim/See Tickets Affiliate",
-        replace_existing=True,
-        max_instances=1,
-    )
-
-    # Scraper jobs
-    for city_slug, sources in _sources.items():
-        for source in sources:
-            jid = f"scraper_{city_slug}_{source['_db_id']}"
+    # ── Scraper jobs ──────────────────────────────────────────────────────────
+    for city_slug, source_list in _sources.items():
+        for source in source_list:
+            job_id = f"scraper_{city_slug}_{source['_db_id']}"
             scheduler.add_job(
                 _run_scraper,
                 trigger=IntervalTrigger(seconds=SCRAPER_INTERVAL),
-                args=[source, _city_dict(city_slug)],
-                id=jid,
-                name=f"{source['name']} / {city_slug}",
+                args=[source, _get_city(city_slug)],
+                id=job_id,
+                name=f"{source['name']}/{city_slug}",
                 replace_existing=True,
                 max_instances=1,
+                # Same misfire reasoning as the TM jobs above -- see that
+                # comment for the full explanation.
+                misfire_grace_time=300,
             )
+    log.info("Scheduled %d scraper jobs", sum(len(v) for v in _sources.values()))
 
-    # Discovery jobs -- one per city, weekly. Intentionally NOT fired
-    # immediately on startup (see _fire_all) since a single run takes
-    # ~30-40 minutes against the public OSM Overpass mirror.
-    for city in _cities:
-        scheduler.add_job(
-            _run_discovery,
-            trigger=IntervalTrigger(seconds=DISCOVERY_INTERVAL),
-            args=[city],
-            id=f"discovery_{city['slug']}",
-            name=f"Source Discovery – {city['name']}",
-            replace_existing=True,
-            max_instances=1,
-        )
-
-    # DB refresh
+    # ── Refresh job ───────────────────────────────────────────────────────────
     scheduler.add_job(
-        _refresh,
+        _refresh_cities_and_sources,
         trigger=IntervalTrigger(seconds=3600),
         args=[scheduler],
-        id="db_refresh",
-        name="Refresh cities + sources",
+        id="refresh_db",
+        name="Refresh cities + sources from WP DB",
         replace_existing=True,
+        misfire_grace_time=300,
     )
 
     scheduler.start()
 
-    # Fire everything immediately
-    _fire_all(scheduler)
+    # Fire Ticketmaster and scrapers immediately on startup
+    for city in _cities:
+        scheduler.get_job(f"tm_{city['slug']}").modify(next_run_time=_now())
+    for city_slug, source_list in _sources.items():
+        for source in source_list:
+            job_id = f"scraper_{city_slug}_{source['_db_id']}"
+            job = scheduler.get_job(job_id)
+            if job:
+                job.modify(next_run_time=_now())
 
-    log.info("Scheduler started — %d cities, %d sources",
+    log.info("Scheduler started with %d cities, %d sources",
              len(_cities), sum(len(v) for v in _sources.values()))
     return scheduler
 
 
-def _fire_all(scheduler: BackgroundScheduler):
-    now = datetime.now(timezone.utc)
-    for job in scheduler.get_jobs():
-        if job.id == "db_refresh" or job.id.startswith("discovery_"):
-            continue
-        try:
-            job.modify(next_run_time=now)
-        except Exception:
-            pass
-
-
-def _run_discovery(city: dict):
-    from discover_sources import discover_for_city, send_summary_email
-    from config import _get_conn
-    conn = _get_conn()
-    try:
-        found = discover_for_city(city, conn, dry_run=False)
-        log.info("Discovery %s: %d new probation sources added", city["name"], len(found))
-        if found:
-            send_summary_email(found)
-    except Exception as e:
-        log.error("Discovery job failed for %s: %s", city["name"], e, exc_info=True)
-    finally:
-        conn.close()
-
+# ── Job runners ───────────────────────────────────────────────────────────────
 
 def _run_ticketmaster(city: dict):
     from ticketmaster import pull_city
     from db import insert_event
+
     try:
         events   = pull_city(city)
         inserted = skipped = 0
-        for ev in events:
-            if insert_event(ev, city):
+        for event in events:
+            if insert_event(event, city):
                 inserted += 1
             else:
                 skipped += 1
-        log.info("TM %s: %d inserted, %d skipped", city["name"], inserted, skipped)
+        log.info("Ticketmaster %s: %d inserted, %d skipped", city["name"], inserted, skipped)
     except Exception as e:
-        log.error("TM job failed for %s: %s", city["name"], e, exc_info=True)
-
-
-def _run_eventim():
-    from eventim import pull_all_cities
-    from db import insert_event
-    try:
-        events_by_city = pull_all_cities()
-        total_inserted = total_skipped = 0
-        for city_slug, events in events_by_city.items():
-            city = _city_dict(city_slug)
-            inserted = skipped = 0
-            for ev in events:
-                if insert_event(ev, city):
-                    inserted += 1
-                else:
-                    skipped += 1
-            log.info("Eventim %s: %d inserted, %d skipped", city["name"], inserted, skipped)
-            total_inserted += inserted
-            total_skipped += skipped
-        log.info("Eventim total: %d inserted, %d skipped", total_inserted, total_skipped)
-    except Exception as e:
-        log.error("Eventim job failed: %s", e, exc_info=True)
+        log.error("Ticketmaster job failed for %s: %s", city["name"], e, exc_info=True)
 
 
 def _run_scraper(source: dict, city: dict):
     from scraper import scrape_source
     from enricher import enrich_events
     from db import insert_event
+
     try:
         events   = scrape_source(source, city)
         events   = enrich_events(events)
         inserted = skipped = 0
-        for ev in events:
-            if insert_event(ev, city):
+        for event in events:
+            if insert_event(event, city):
                 inserted += 1
             else:
                 skipped += 1
         log.info("Scraper '%s' %s: %d inserted, %d skipped",
                  source["name"], city["name"], inserted, skipped)
-        if source.get("_db_id"):
-            update_source_stats(source["_db_id"], inserted)
+
+        db_id = source.get("_db_id")
+        if db_id:
+            update_source_stats(db_id, inserted)
+
     except Exception as e:
-        log.error("Scraper failed %s/%s: %s",
+        log.error("Scraper failed for %s/%s: %s",
                   source.get("name"), city.get("name"), e, exc_info=True)
 
 
-def _refresh(scheduler: BackgroundScheduler):
+def _refresh_cities_and_sources(scheduler: BackgroundScheduler):
+    """Reload cities and sources from DB. Adds new jobs for anything not already scheduled."""
     global _cities, _sources
-    log.info("Refreshing cities and sources from DB")
+    log.info("Scheduler: Refreshing cities and sources from WP DB...")
+
     try:
         new_cities  = load_cities()
         new_sources = load_dynamic_sources()
@@ -215,57 +164,53 @@ def _refresh(scheduler: BackgroundScheduler):
     _cities  = new_cities
     _sources = new_sources
 
-    now = datetime.now(timezone.utc)
-
+    # Add any new Ticketmaster jobs
     for city in _cities:
-        jid = f"tm_{city['slug']}"
-        if not scheduler.get_job(jid):
+        job_id = f"tm_{city['slug']}"
+        if not scheduler.get_job(job_id):
             scheduler.add_job(
                 _run_ticketmaster,
                 trigger=IntervalTrigger(seconds=TICKETMASTER_INTERVAL),
-                args=[city], id=jid,
-                name=f"Ticketmaster – {city['name']}",
-                replace_existing=True, max_instances=1,
+                args=[city],
+                id=job_id,
+                name=f"Ticketmaster - {city['name']}",
+                replace_existing=True,
+                max_instances=1,
+                misfire_grace_time=300,
             )
-            scheduler.get_job(jid).modify(next_run_time=now)
-            log.info("Added TM job for new city: %s", city["name"])
+            log.info("Added new Ticketmaster job for %s", city["name"])
 
-        disc_jid = f"discovery_{city['slug']}"
-        if not scheduler.get_job(disc_jid):
-            scheduler.add_job(
-                _run_discovery,
-                trigger=IntervalTrigger(seconds=DISCOVERY_INTERVAL),
-                args=[city], id=disc_jid,
-                name=f"Source Discovery – {city['name']}",
-                replace_existing=True, max_instances=1,
-            )
-            # Deliberately NOT firing immediately -- a single discovery
-            # run takes ~30-40 min against the public OSM Overpass
-            # mirror. New cities wait for their normal weekly slot,
-            # same as every other city.
-            log.info("Added Discovery job for new city: %s (first run in ~%dh)",
-                      city["name"], DISCOVERY_INTERVAL // 3600)
-
-    for city_slug, sources in _sources.items():
-        for source in sources:
-            jid = f"scraper_{city_slug}_{source['_db_id']}"
-            if not scheduler.get_job(jid):
+    # Add any new scraper jobs
+    for city_slug, source_list in _sources.items():
+        for source in source_list:
+            job_id = f"scraper_{city_slug}_{source['_db_id']}"
+            if not scheduler.get_job(job_id):
                 scheduler.add_job(
                     _run_scraper,
                     trigger=IntervalTrigger(seconds=SCRAPER_INTERVAL),
-                    args=[source, _city_dict(city_slug)],
-                    id=jid, name=f"{source['name']} / {city_slug}",
-                    replace_existing=True, max_instances=1,
+                    args=[source, _get_city(city_slug)],
+                    id=job_id,
+                    name=f"{source['name']}/{city_slug}",
+                    replace_existing=True,
+                    max_instances=1,
+                    misfire_grace_time=300,
                 )
-                scheduler.get_job(jid).modify(next_run_time=now)
-                log.info("Added scraper job: %s / %s", source["name"], city_slug)
+                log.info("Added new scraper job: %s / %s", source["name"], city_slug)
 
-    log.info("Refresh done — %d cities, %d sources",
+    log.info("Refresh complete: %d cities, %d sources",
              len(_cities), sum(len(v) for v in _sources.values()))
 
 
-def _city_dict(slug: str) -> dict:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_city(slug: str) -> dict:
+    """Return the city dict for a given slug, or a minimal fallback."""
     for c in _cities:
         if c["slug"] == slug:
             return c
-    return {"slug": slug, "name": slug.title(), "lat": 0, "lng": 0, "timezone": "America/Chicago"}
+    return {"slug": slug, "name": slug.title(), "lat": 0, "lng": 0}
+
+
+def _now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
