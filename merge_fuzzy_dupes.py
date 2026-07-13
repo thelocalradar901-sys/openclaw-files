@@ -154,14 +154,34 @@ def find_pairs(conn):
                    _NUMBERED_OCCURRENCE_RE.search(b["post_title"] or ""):
                     continue
 
-                if _is_lineup_show(a["post_title"] or "") or _is_lineup_show(b["post_title"] or ""):
-                    continue
-
                 ratio = difflib.SequenceMatcher(None, a["_norm_title"], b["_norm_title"]).ratio()
                 is_prefix = (_is_headliner_prefix_match(a["_norm_title"], b["_norm_title"]) or
                              _is_headliner_prefix_match(b["_norm_title"], a["_norm_title"]))
                 if is_prefix:
                     ratio = max(ratio, TITLE_SIMILARITY_THRESHOLD)
+
+                a_is_lineup = _is_lineup_show(a["post_title"] or "")
+                b_is_lineup = _is_lineup_show(b["post_title"] or "")
+                if a_is_lineup and b_is_lineup:
+                    # Both sides are full lineup-style titles -- this is the
+                    # confirmed 2026-07-07 collision case (Gay Ole Opry vs
+                    # BACKSTAGE NASHVILLE vs Long Players), where similarity
+                    # alone can't tell genuinely different shows apart from
+                    # dupes. Never auto-merge two lineup titles.
+                    continue
+                if (a_is_lineup or b_is_lineup) and not is_prefix:
+                    # One side is a bare/generic series title, the other a
+                    # specific lineup title, but they're not a prefix match
+                    # of each other -- not confident this is the same show
+                    # (could be a different night's lineup for the same
+                    # recurring series). Skip.
+                    continue
+                # Remaining case: one side is a bare series title (e.g.
+                # "Bluebird On 3rd") and it's a prefix of the other's
+                # specific lineup title (e.g. "Bluebird On 3rd featuring
+                # Gabe Dixon...") on the SAME venue+date -- this is the
+                # generic listing + specific listing of the identical show,
+                # safe to merge.
                 if ratio >= TITLE_SIMILARITY_THRESHOLD:
                     pairs.append((ratio, a, b))
     return pairs
