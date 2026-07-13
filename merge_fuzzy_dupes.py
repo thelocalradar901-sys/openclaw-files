@@ -187,8 +187,37 @@ def find_pairs(conn):
     return pairs
 
 
+_STATUS_FLAG_RE = re.compile(
+    r"\bcancell?ed\b|\bsold\s*out\b|\bpostponed\b", re.IGNORECASE
+)
+
+def _has_status_flag(title: str) -> bool:
+    return bool(_STATUS_FLAG_RE.search(title or ""))
+
+
 def plan_merge(a, b):
     """Decide primary/secondary and the field values the primary should end up with."""
+    a_flagged = _has_status_flag(a["post_title"])
+    b_flagged = _has_status_flag(b["post_title"])
+    if a_flagged != b_flagged:
+        # CANCELLED / SOLD OUT / POSTPONED status is live, time-sensitive
+        # info -- confirmed 2026-07-13: normal primary selection (affiliate
+        # rank -> thumbnail -> earliest post_id) would delete the flagged
+        # post and keep the stale unflagged one, silently un-cancelling a
+        # show on the site. The flagged post always wins primary so its
+        # title (and thus status) survives the merge.
+        primary, secondary = (a, b) if a_flagged else (b, a)
+        updates = {}
+        if not primary["ticket_url"] and secondary["ticket_url"]:
+            updates["_EventURL"] = secondary["ticket_url"]
+        if not primary["thumb_id"] and secondary["thumb_id"]:
+            updates["_thumbnail_id"] = secondary["thumb_id"]
+        p_len = len((primary["post_content"] or "").strip())
+        s_len = len((secondary["post_content"] or "").strip())
+        if s_len > p_len:
+            updates["post_content"] = secondary["post_content"]
+        return primary, secondary, updates
+
     a_rank = affiliate_rank(a["ticket_url"])
     b_rank = affiliate_rank(b["ticket_url"])
 
