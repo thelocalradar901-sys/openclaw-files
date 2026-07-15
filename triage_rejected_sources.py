@@ -33,6 +33,25 @@ TWO PASSES PER SOURCE:
      before, so what's left over is a short, categorized punch list
      instead of "everything is still just rejected."
 
+BATCH DIAGNOSTIC DUMP (the point of this section): every source landing
+in markup_not_matched gets its raw fetched HTML saved to
+/opt/openclaw/triage_html_dump/<city>__<name>.html, plus an expanded
+diagnostic line covering known-selector hits, fallback-container counts,
+JSON-LD script counts, AND multi-iCal link counts (even below the
+min_links threshold, so a near-miss is visible instead of silently
+looking identical to "found nothing at all"). This exists specifically
+so that finding the next generalizable pattern doesn't require a
+one-at-a-time "run the debug tool on this one URL" round trip -- run this
+script once across a whole city (or everything), then hand over the
+WHOLE dump directory in one shot:
+
+    tar czf /tmp/triage_dump.tar.gz -C /opt/openclaw triage_html_dump
+    (then upload /tmp/triage_dump.tar.gz)
+
+That's what turns "investigate 19 sites one at a time" into "investigate
+19 sites' real markup in one pass, looking for the two or three shared
+patterns worth fixing generally."
+
 Reads DB credentials straight out of /etc/openclaw/openclaw.env and
 shells out to the `mysql` CLI -- no assumptions about which Python MySQL
 driver (if any) is installed in the venv.
@@ -226,6 +245,28 @@ def _revisit_source(source: dict, city_slug: str) -> int:
     return 0
 
 
+DUMP_DIR = "/opt/openclaw/triage_html_dump"
+
+
+def _dump_html(source: dict, html: str):
+    """Save the raw fetched HTML for a still-broken source to disk, so a
+    full batch run produces a directory of real markup samples that can
+    be reviewed and tarred up in one shot -- instead of asking for a
+    live re-fetch of one URL at a time every time a new pattern needs
+    investigating. Best-effort: a write failure here should never break
+    the triage run itself."""
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        safe_city = re.sub(r"[^a-zA-Z0-9_-]", "_", source.get("__city_slug", "unknown"))
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", source["name"])[:80]
+        path = os.path.join(DUMP_DIR, f"{safe_city}__{safe_name}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass  # diagnostic convenience only -- never let this break classification
+
+
+
 def _classify(source: dict) -> tuple:
     """PASS 2 (only reached if pass 1 found 0): returns (bucket, detail)
     explaining WHY. Never raises -- a classification failure is itself
@@ -263,17 +304,33 @@ def _classify(source: dict) -> tuple:
         # instead of running the CLI debug tool on each one individually.
         # Not a full re-implementation of _parse_heuristic's logic -- just
         # enough signal to see, at a glance, whether ANY known selector
-        # hit, and roughly how many fallback heading candidates exist.
+        # hit, how many fallback heading candidates exist, and whether
+        # this looks like a near-miss multi-iCal case (some per-event
+        # ical links present, just not enough to clear the min_links
+        # threshold -- distinguishing that from "zero ical links at all"
+        # matters: a near-miss might just need the threshold tuned, while
+        # zero means this site genuinely doesn't expose that pattern).
         try:
             soup = BeautifulSoup(plain_html, "html.parser")
             selector_hit = next((sel for sel in scraper._EVENT_SELECTORS if soup.select(sel)), None)
-            containers = (soup.select(selector_hit) if selector_hit
-                          else scraper._fallback_heading_containers(soup))
+            if selector_hit:
+                containers = scraper._dedupe_nested_matches(soup.select(selector_hit))
+            else:
+                containers = scraper._fallback_heading_containers(soup)
             jsonld_count = len(soup.find_all("script", {"type": "application/ld+json"}))
+
+            # min_links=1 here on purpose -- we want the RAW count for
+            # diagnostic visibility, not scraper.py's production threshold
+            # (3). A count of 1-2 still tells us something useful (a near
+            # miss) that a plain "multi_ical=0" would hide.
+            multi_ical_links = scraper._detect_multi_ical(plain_html, url, min_links=1)
+
             diag = (f"selector_hit={selector_hit!r} fallback_containers={len(containers)} "
-                    f"jsonld_scripts={jsonld_count}")
+                    f"jsonld_scripts={jsonld_count} multi_ical_links={len(multi_ical_links)}")
         except Exception as e:
             diag = f"diagnostic failed: {type(e).__name__}: {e}"
+
+        _dump_html(source, plain_html)
 
         return ("markup_not_matched",
                  f"{plain_len} bytes fetched OK, no tier matched -- {diag}")
@@ -326,6 +383,7 @@ def main():
 
     for i, row in enumerate(rows, 1):
         source = _build_source_dict(row)
+        source["__city_slug"] = row["city_slug"]  # used only for the HTML dump filename
         label = f"[{i}/{len(rows)}] {row['city_slug']:12s} {row['name']:45s}"
 
         if not row["url"]:
@@ -411,6 +469,14 @@ def main():
         print(f"\n{bucket}  ({len(items)})")
         for name, city_slug, detail in items:
             print(f"    - [{city_slug}] {name}: {detail}")
+
+    if os.path.isdir(DUMP_DIR) and os.listdir(DUMP_DIR):
+        print("\n" + "=" * 78)
+        print(f"Raw HTML saved for every markup_not_matched source -> {DUMP_DIR}")
+        print("To review all of them in one batch instead of one URL at a time:")
+        print(f"    tar czf /tmp/triage_dump.tar.gz -C {os.path.dirname(DUMP_DIR)} "
+              f"{os.path.basename(DUMP_DIR)}")
+        print("    (then upload /tmp/triage_dump.tar.gz)")
 
 
 if __name__ == "__main__":
