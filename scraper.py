@@ -213,14 +213,62 @@ def _clean_title(title: str) -> str:
     return _TITLE_JUNK_SUFFIXES.sub("", title or "").strip()
 
 
+# ── Relay fetch (ASN/IP-reputation blocks) ────────────────────────────────────
+#
+# Some sources block requests from the Hetzner IP range outright, at the
+# firewall/WAF level, regardless of User-Agent -- confirmed on Parker Arts
+# (403 on both the transparent OpenClaw UA and a full browser UA from the
+# same box). browser_ua solves sites that fingerprint on header content;
+# this solves sites that fingerprint on WHERE the request is coming from.
+# Same underlying idea as the existing ticketweb-image-relay Cloudflare
+# Worker (which solves this for TicketWeb's *images* specifically) --
+# generalized here into a reusable full-page relay any source can opt
+# into, instead of building a new one-off Worker per blocked site.
+#
+# Opt-in per source via {"html_relay": true} in wp_openclaw_sources.notes,
+# same convention as browser_ua/require_image. Requires HTML_RELAY_URL to
+# be set in config.py / openclaw.env pointing at the deployed Worker (see
+# accompanying cloudflare-html-relay-worker.js). If it isn't configured,
+# this logs a warning once and falls straight back to a direct fetch
+# rather than crashing the source -- a relay-flagged source with no relay
+# configured yet should degrade to "still 403s, same as before," not
+# "throws."
+
+def _relay_get(url, *, timeout=TIMEOUT, source_name=""):
+    from urllib.parse import quote
+    try:
+        from config import HTML_RELAY_URL
+    except Exception:
+        HTML_RELAY_URL = ""
+
+    if not HTML_RELAY_URL:
+        log.warning("[%s] html_relay requested but HTML_RELAY_URL is not configured -- "
+                    "falling back to a direct fetch (will likely still be blocked)",
+                    source_name)
+        return _request_get(url, headers=HEADERS, timeout=timeout, source_name=source_name)
+
+    relay_url = f"{HTML_RELAY_URL.rstrip('/')}/?url={quote(url, safe='')}"
+    # Give the relay itself a little extra headroom beyond our own timeout,
+    # since it's making its own outbound fetch on top of ours.
+    return _request_get(relay_url, timeout=timeout + 10, source_name=f"{source_name} (relay)")
+
+
+def _fetch_source_page(source: dict, url: str, timeout=TIMEOUT):
+    """Fetch a source's page, routing through the relay if this source has
+    html_relay=true configured (see _relay_get docstring)."""
+    if source.get("html_relay"):
+        return _relay_get(url, timeout=timeout, source_name=source.get("name", ""))
+    return _request_get(url, headers=_headers_for(source), timeout=timeout,
+                         source_name=source.get("name", ""))
+
+
 # ── html_auto: universal, multi-tier ──────────────────────────────────────────
 
 def _scrape_html_auto(source: dict, city_slug: str, city_name: str,
                       tz_name: str = "America/Chicago") -> list[dict]:
     url = source["url"]
     try:
-        resp = _request_get(url, headers=_headers_for(source), timeout=TIMEOUT,
-                             source_name=source.get("name", ""))
+        resp = _fetch_source_page(source, url, timeout=TIMEOUT)
     except Exception as e:
         log.warning("Fetch failed for %s: %s", source.get("name"), e)
         return []
