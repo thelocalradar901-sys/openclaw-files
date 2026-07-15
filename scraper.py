@@ -145,6 +145,8 @@ def scrape_source(source: dict, city) -> list[dict]:
             events = _scrape_json_api(source, city_slug, city_name)
         elif stype == "generic_html":
             events = _scrape_generic_html(source, city_slug, city_name)
+        elif stype == "ajax_paginate":
+            events = _scrape_ajax_paginate(source, city_slug, city_name)
         else:
             log.warning("Unknown source_type '%s' — trying html_auto", stype)
             events = _scrape_html_auto(source, city_slug, city_name, tz_name)
@@ -1762,6 +1764,119 @@ def _scrape_json_api(source: dict, city_slug: str, city_name: str) -> list[dict]
         time.sleep(0.5)
 
     log.info("[%s] JSON API: %d events", source.get("name"), len(events))
+    return events
+
+
+# ── AJAX-paginated "infinite scroll" ─────────────────────────────────────────
+#
+# Confirmed real-world pattern: Ryman Auditorium (AXS platform). The visible
+# page only server-renders a first batch of events; every subsequent batch
+# loads via a numbered/offset AJAX endpoint as the user scrolls:
+#
+#   GET /events/events_ajax/<offset>?category=0&venue=0&team=0&exclude=
+#       &per_page=12&came_from_page=event-list-page
+#
+# The response body is NOT structured JSON with event fields -- it's a
+# JSON-encoded STRING containing a raw HTML fragment (the exact same
+# "eventItem"/"h3.title"/"m-date__month" markup as the main page), meant
+# to be decoded and injected straight into the DOM client-side.
+#
+# Because that fragment uses identical markup to what _parse_heuristic
+# already handles via its fallback-heading-container path, this tier does
+# NOT need its own title/date extraction logic at all -- it only needs to
+# walk the offsets, unwrap the JSON-string-encoded HTML, and hand each
+# chunk to the existing _parse_heuristic(). Any other site using this same
+# "infinite scroll via numbered AJAX + JSON-string HTML" pattern (a fairly
+# common approach, not unique to AXS) gets covered by the same tier.
+#
+# Deliberately NOT auto-detected -- the offset URL template and per-page
+# count aren't safely guessable from the main page alone (found once via
+# browser devtools Network tab, watching what fires while scrolling).
+# Configured entirely via notes JSON:
+#     {
+#       "ajax_paginate": true,
+#       "ajax_url_template": "https://www.ryman.com/events/events_ajax/{offset}?category=0&venue=0&team=0&exclude=&per_page=12&came_from_page=event-list-page",
+#       "ajax_per_page": 12
+#     }
+# and source_type set to "ajax_paginate" (a free-text DB column -- no
+# Monitor dropdown entry required to use it, though one could be added).
+
+def _scrape_ajax_paginate(source: dict, city_slug: str, city_name: str) -> list[dict]:
+    import json as _json
+
+    template = source.get("ajax_url_template", "")
+    if not template or "{offset}" not in template:
+        log.warning("[%s] ajax_paginate configured but ajax_url_template is missing "
+                    "or has no {offset} placeholder -- nothing to fetch", source.get("name"))
+        return []
+
+    try:
+        per_page = int(source.get("ajax_per_page", 12))
+    except (TypeError, ValueError):
+        per_page = 12
+
+    # Backstop, same philosophy as TEC REST/JSON API pagination elsewhere
+    # in this file: don't hammer a site indefinitely. 20 pages * 12/page
+    # = 240 events max per scrape cycle, regardless of how deep the real
+    # listing goes.
+    MAX_PAGES = 20
+
+    events    = []
+    seen_keys = set()
+
+    for page_num in range(MAX_PAGES):
+        offset = page_num * per_page
+        url = template.format(offset=offset)
+        try:
+            resp = _request_get(url, headers=_headers_for(source), timeout=TIMEOUT,
+                                source_name=source.get("name", ""))
+        except Exception as e:
+            log.info("[%s] ajax_paginate stopped at offset %d: %s",
+                     source.get("name"), offset, e)
+            break
+
+        try:
+            # The confirmed real response is a JSON-encoded STRING
+            # containing HTML (e.g. the raw body is `"<div>...</div>\n"`,
+            # quotes and all) -- json.loads() unwraps that back to a
+            # plain HTML string.
+            fragment_html = _json.loads(resp.text)
+            if not isinstance(fragment_html, str):
+                fragment_html = resp.text
+        except Exception:
+            # Some other ajax_paginate source might return raw HTML
+            # directly rather than JSON-string-wrapped HTML like Ryman --
+            # don't assume every site using this tier is wrapped the same
+            # way, just fall back to the raw body.
+            fragment_html = resp.text
+
+        if not fragment_html or not fragment_html.strip():
+            log.info("[%s] ajax_paginate: empty page at offset %d, stopping",
+                     source.get("name"), offset)
+            break
+
+        page_events = _parse_heuristic(fragment_html, url, source, city_slug, city_name)
+
+        new_count = 0
+        for ev in page_events:
+            key = ev["title"].lower() + "|" + ev["start_date"][:10]
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            events.append(ev)
+            new_count += 1
+
+        if new_count == 0:
+            # Either genuinely exhausted the listing, or this offset
+            # returned a repeat of events already seen -- either way,
+            # no point requesting further pages.
+            log.info("[%s] ajax_paginate: no new events at offset %d, stopping",
+                     source.get("name"), offset)
+            break
+
+        time.sleep(0.5)
+
+    log.info("[%s] ajax_paginate: %d total events", source.get("name"), len(events))
     return events
 
 

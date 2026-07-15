@@ -163,9 +163,13 @@ def _build_source_dict(row: dict) -> dict:
 
 # Known-good dropdown values (see openclaw-monitor.php stypes()) -- anything
 # else stored in source_type is a stale/orphaned label that silently falls
-# through to html_auto regardless of what it says.
+# through to html_auto regardless of what it says. ajax_paginate is newer
+# than the Monitor dropdown (added for AXS-style infinite-scroll listings
+# like Ryman Auditorium) and set via direct SQL rather than the UI, but is
+# just as real a type as the others -- included here so it isn't
+# misreported as stale.
 _KNOWN_TYPES = {"html_auto", "seetickets", "tec_rest", "ical_url", "json_api",
-                "generic_html", "auto", "squarespace"}
+                "generic_html", "auto", "squarespace", "ajax_paginate"}
 
 
 def _revisit_source(source: dict, city_slug: str) -> int:
@@ -241,6 +245,8 @@ def _revisit_source(source: dict, city_slug: str) -> int:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(resp.text, "html.parser")
         return len(soup.select(source["event_container_selector"]))
+    elif stype == "ajax_paginate":
+        return len(scraper._scrape_ajax_paginate(source, city_slug, city_name))
 
     return 0
 
