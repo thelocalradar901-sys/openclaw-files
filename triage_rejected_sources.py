@@ -241,6 +241,8 @@ def _classify(source: dict) -> tuple:
     dead_domain_or_connection_error instead of getting the browser_ua/
     html_relay check it needed).
     """
+    from bs4 import BeautifulSoup
+
     name, url = source["name"], source["url"]
 
     if not url:
@@ -255,9 +257,37 @@ def _classify(source: dict) -> tuple:
     if plain_status == 200:
         if len(plain_html) < 3000 and "/event" not in plain_html.lower():
             return ("likely_js_rendered_empty_shell", f"{plain_len} bytes, no event links in raw HTML")
-        return ("markup_not_matched", f"{plain_len} bytes fetched OK, no tier matched -- needs manual markup review")
 
-    if plain_status in (403, 406, 429):
+        # Lightweight diagnostic so a whole pile of markup_not_matched
+        # sources can be scanned for common patterns in one report,
+        # instead of running the CLI debug tool on each one individually.
+        # Not a full re-implementation of _parse_heuristic's logic -- just
+        # enough signal to see, at a glance, whether ANY known selector
+        # hit, and roughly how many fallback heading candidates exist.
+        try:
+            soup = BeautifulSoup(plain_html, "html.parser")
+            selector_hit = next((sel for sel in scraper._EVENT_SELECTORS if soup.select(sel)), None)
+            containers = (soup.select(selector_hit) if selector_hit
+                          else scraper._fallback_heading_containers(soup))
+            jsonld_count = len(soup.find_all("script", {"type": "application/ld+json"}))
+            diag = (f"selector_hit={selector_hit!r} fallback_containers={len(containers)} "
+                    f"jsonld_scripts={jsonld_count}")
+        except Exception as e:
+            diag = f"diagnostic failed: {type(e).__name__}: {e}"
+
+        return ("markup_not_matched",
+                 f"{plain_len} bytes fetched OK, no tier matched -- {diag}")
+
+    # 202 included alongside the usual bot-block statuses -- seen
+    # recurring across multiple otherwise-unrelated sources in this run
+    # (Eastside Bowl, Alabama Theatre, Red Mountain Theatre, The Lyric
+    # Theatre). A 202 on a plain GET for a static event listing page is
+    # not a normal "accepted, processing" response -- that status code
+    # doesn't mean anything for a synchronous page load. Far more likely
+    # explanation: a WAF/CDN handing non-browser clients a placeholder
+    # "202" instead of a clean block, the same underlying pattern as the
+    # 403 cases, just a different status code for it.
+    if plain_status in (403, 406, 429, 202):
         try:
             resp2 = requests.get(url, headers=scraper.BROWSER_HEADERS, timeout=15)
             if resp2.status_code == 200:
