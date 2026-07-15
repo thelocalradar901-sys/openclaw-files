@@ -1174,10 +1174,32 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
     seen       = set()
 
     for c in containers[:60]:
-        title_el = c.select_one("h1,h2,h3,[class*='title'],[class*='summary']")
+        # Confirmed real-world gap: TicketWeb's "tw-widget-event" markup
+        # (seen independently on Hop Springs - Outdoors AND Marathon Music
+        # Works -- same third-party widget, different venues) puts the
+        # title in <div class="tw-event-name">, which the original
+        # title/summary-only selector never matched. Same root cause on
+        # Nashville Superspeedway, a different platform entirely, whose
+        # title sits in a bare <div class="event">. [class~='event'] is a
+        # whole-token match (only fires when "event" is exactly one of the
+        # element's class tokens, e.g. class="event" or class="event foo")
+        # -- deliberately NOT a [class*='event'] substring match, which
+        # would be far too broad and risk matching a container's own class
+        # (many things are named "event-card", "event-item", etc.) instead
+        # of the actual title inside it.
+        title_el = c.select_one(
+            "h1,h2,h3,[class*='title'],[class*='summary'],"
+            "[class*='event-name'],[class*='event-title'],[class~='event']"
+        )
         if not title_el:
             continue
-        title = title_el.get_text(strip=True)
+        # get_text(" ", strip=True) here for the same reason as the date
+        # extraction fix below -- confirmed real bug on Nashville
+        # Superspeedway, whose title div has a nested suffix div
+        # ("Grand Prix" + "presented by OnlyBulls" as separate text
+        # nodes), which glued into "Grand Prixpresented by..." with no
+        # separator.
+        title = title_el.get_text(" ", strip=True)
         if not title:
             continue
         # Etix/Hi-Tone-style headings glue the date onto the title text
@@ -1212,7 +1234,14 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
         date_el  = c.select_one("time[datetime]") or c.select_one("time") or c.select_one("[class*='date']")
         date_str = ""
         if date_el:
-            date_str = date_el.get("datetime") or date_el.get_text(strip=True)
+            # get_text(" ", strip=True) -- NOT get_text(strip=True) --
+            # deliberately, here. Confirmed real bug on TicketWeb's date
+            # div, whose content is several separate text nodes across
+            # multiple lines ("Sep Wed 16", "@", "7:30 pm"). Without an
+            # explicit separator, BeautifulSoup concatenates adjacent text
+            # nodes with nothing between them (e.g. "16@7:30pm"), which
+            # dateutil's fuzzy parser can easily fail to split correctly.
+            date_str = date_el.get("datetime") or date_el.get_text(" ", strip=True)
 
         if range_match and not (date_el and date_el.get("datetime")):
             date_str = f"{range_match.group(1)}, {range_match.group(2)}"
