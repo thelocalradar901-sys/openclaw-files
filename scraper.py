@@ -704,6 +704,43 @@ def _year_inferred_default(date_str: str):
     return datetime(year, 1, 1)
 
 
+def _dedupe_nested_matches(elements: list) -> list:
+    """
+    Keep only the OUTERMOST matches from a CSS selector result -- drop any
+    matched element that is itself a descendant of another matched element
+    in the same result set.
+
+    Confirmed real-world trigger: WordPress's "The Events Calendar" plugin
+    uses BEM-style class naming for its "Latest Past Events" widget --
+    e.g. tribe-events-calendar-latest-past__event (the actual per-event
+    container), tribe-events-calendar-latest-past__event-title,
+    ...__event-date-tag, ...__event-featured-image, etc. (each event's
+    internal sub-pieces). A substring selector like [class*='tribe-event']
+    matches ALL of these at once -- the real container AND every one of
+    its own children -- since every BEM sub-element name also contains
+    "tribe-event". Confirmed on Dzire Bar And Lounge: 145 elements matched
+    for what was actually a much smaller number of real events, because
+    each event contributed itself plus ~7-10 of its own nested pieces to
+    the match count. Extracting title/date from one of those nested
+    pieces in isolation (e.g. just the image-wrapper div) finds nothing,
+    since the real title/date live in SIBLING pieces, not inside that one
+    fragment -- hence 0 events despite well over 100 "matches."
+
+    General fix, not a Dzire-specific patch: any sufficiently broad
+    substring selector in _EVENT_SELECTORS is exposed to this same
+    failure mode on any BEM-ish (or otherwise nested-naming) theme, so
+    this runs for every selector match, not just the tribe-event one.
+    """
+    if len(elements) <= 1:
+        return elements
+    match_ids = set(id(e) for e in elements)
+    kept = []
+    for el in elements:
+        if not any(id(ancestor) in match_ids for ancestor in el.parents):
+            kept.append(el)
+    return kept
+
+
 def _nearby_sibling_anchor(tag, max_hops: int = 3):
     """
     For headings with no <a> of their own, look up to `max_hops` siblings
@@ -1099,7 +1136,7 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
     for sel in _EVENT_SELECTORS:
         found = soup.select(sel)
         if found:
-            containers = found
+            containers = _dedupe_nested_matches(found)
             break
 
     if not containers:
@@ -1161,8 +1198,18 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
         # scan further down.
         range_match = _DATE_RANGE_RE.search(full_text)
 
-        # Date: prefer <time datetime="..."> attribute, fall back to visible text
-        date_el  = c.select_one("time,[class*='date']")
+        # Date: a real <time> element is always more trustworthy than a
+        # generic [class*='date'] match -- a <time datetime="..."> carries
+        # a structured, ISO8601 value, while a class-matched span can just
+        # as easily be a weekday abbreviation, a "date-tag" label, or some
+        # other fragment that isn't a usable date on its own. Confirmed
+        # real-world trigger: WordPress TEC's "Latest Past Events" widget
+        # has a <span class="...__event-date-tag-weekday">Sun</span>
+        # sitting BEFORE the actual <time datetime="..."> in document
+        # order -- select_one() on a combined "time,[class*='date']"
+        # selector returns whichever matches first, so it was picking the
+        # bare weekday text over the real structured date every time.
+        date_el  = c.select_one("time[datetime]") or c.select_one("time") or c.select_one("[class*='date']")
         date_str = ""
         if date_el:
             date_str = date_el.get("datetime") or date_el.get_text(strip=True)
@@ -1876,7 +1923,13 @@ if __name__ == "__main__":
     for sel in _EVENT_SELECTORS:
         found = soup_dbg.select(sel)
         if found:
-            print(f"  MATCHED '{sel}': {len(found)} elements")
+            deduped = _dedupe_nested_matches(found)
+            if len(deduped) != len(found):
+                print(f"  MATCHED '{sel}': {len(found)} raw elements -> "
+                      f"{len(deduped)} after dropping nested sub-element matches "
+                      f"(BEM-style class naming -- see _dedupe_nested_matches)")
+            else:
+                print(f"  MATCHED '{sel}': {len(found)} elements")
     else_matched = any(soup_dbg.select(sel) for sel in _EVENT_SELECTORS)
     if not else_matched:
         print("  No known selector matched anything — falling to heading-based detection.\n")
