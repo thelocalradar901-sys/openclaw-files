@@ -2,7 +2,8 @@
 scraper.py — OpenClaw HTML/API event scraper
 
 Source types (configured in openclaw-monitor WP plugin):
-  html_auto    — Universal: tries iCal → JSON-LD → heuristic CSS → Ollama AI
+  html_auto    — Universal: tries iCal → multi-iCal → JSON-LD → RHP →
+                 heuristic CSS → Ollama AI
   seetickets   — SeeTickets embedded widget
   tec_rest     — WordPress TEC REST API (/wp-json/tribe/events/v1/events)
   ical_url     — Bare .ics URL
@@ -14,9 +15,20 @@ All fetchers return list of dicts with these keys:
   venue_name, venue_address, venue_city, venue_state, venue_zip,
   organizer_name, cost, source_name, city_slug, categories, tags,
   external_id, _needs_enrichment
+
+2026-07-15 pass: added retry/backoff on all network fetches, a per-event
+iCal harvesting tier for Squarespace-style collections (Riverside Revival),
+a date-range parsing fix (Parker Arts-style "Month D - Month D, YYYY"),
+an orphan-heading fallback for sites that link the poster image instead of
+the title itself (Graceland Live/Wix), a shared year-inference helper used
+by both the RHP and heuristic tiers, and a today's-date anchor in the
+Ollama prompt so year-less date text doesn't get silently mis-dated there
+either. See inline comments at each change for the site/incident that
+motivated it.
 """
 
 import logging
+import random
 import re
 import time
 from datetime import datetime, date, timedelta as _timedelta, timezone as _timezone
@@ -52,6 +64,54 @@ def _headers_for(source: dict) -> dict:
     """Returns BROWSER_HEADERS only if this source has browser_ua=True set,
     otherwise the normal transparent OpenClaw HEADERS used by default."""
     return BROWSER_HEADERS if source.get("browser_ua") else HEADERS
+
+
+# ── Network helper ────────────────────────────────────────────────────────────
+
+def _request_get(url, *, headers=None, params=None, timeout=TIMEOUT,
+                  retries=2, source_name=""):
+    """
+    Wrapper around requests.get() with a short retry/backoff for transient
+    failures -- timeouts, connection resets, and 429/5xx responses.
+
+    A meaningful chunk of "rejected" sources aren't structurally broken at
+    all -- they're flaky infrastructure: a venue CMS timing out under
+    load, a CDN blip, a momentary 503 during our own scrape window. One
+    retry with a short backoff recovers most of those for free, without
+    adding real latency to the sources that already succeed on the first
+    try (the common case).
+
+    Does NOT retry plain 4xx errors other than 429 -- a 404 or 403 isn't
+    going to fix itself by asking again, and browser_ua-style blocks
+    should be solved with that flag, not by hammering the source.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < retries:
+                    wait = (2 ** attempt) + random.uniform(0, 0.5)
+                    log.info("[%s] HTTP %d on attempt %d/%d for %s -- retrying in %.1fs",
+                             source_name, resp.status_code, attempt + 1, retries + 1, url, wait)
+                    time.sleep(wait)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt < retries:
+                wait = (2 ** attempt) + random.uniform(0, 0.5)
+                log.info("[%s] %s on attempt %d/%d for %s -- retrying in %.1fs",
+                         source_name, type(e).__name__, attempt + 1, retries + 1, url, wait)
+                time.sleep(wait)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    # Unreachable in practice (raise_for_status() above always either
+    # returns or raises), but keeps the type checker/callers honest.
+    raise RuntimeError(f"_request_get exhausted retries for {url}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -136,14 +196,31 @@ def _ev(title, description, start_date, end_date, venue_name, ticket_url,
     }
 
 
-# ── html_auto: 4-tier universal ───────────────────────────────────────────────
+# ── Title cleanup ─────────────────────────────────────────────────────────────
+
+_TITLE_JUNK_SUFFIXES = re.compile(
+    r"\s*[|\-–—]\s*(?:Tickets?|Buy Tickets?|Eventbrite|Ticketmaster|"
+    r"Live Nation|See Tickets|AXS|Etix)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_title(title: str) -> str:
+    """Strip common boilerplate ticketing-platform suffixes some sites glue
+    onto their heading/title text (e.g. 'Fred Eaglesmith - Tickets' or
+    'Elmiene | Ticketmaster'), so events don't carry that noise into the
+    title field that just has to get cleaned up again downstream."""
+    return _TITLE_JUNK_SUFFIXES.sub("", title or "").strip()
+
+
+# ── html_auto: universal, multi-tier ──────────────────────────────────────────
 
 def _scrape_html_auto(source: dict, city_slug: str, city_name: str,
                       tz_name: str = "America/Chicago") -> list[dict]:
     url = source["url"]
     try:
-        resp = requests.get(url, headers=_headers_for(source), timeout=TIMEOUT)
-        resp.raise_for_status()
+        resp = _request_get(url, headers=_headers_for(source), timeout=TIMEOUT,
+                             source_name=source.get("name", ""))
     except Exception as e:
         log.warning("Fetch failed for %s: %s", source.get("name"), e)
         return []
@@ -151,13 +228,31 @@ def _scrape_html_auto(source: dict, city_slug: str, city_name: str,
     html    = resp.text
     no_ical = source.get("no_ical", False)
 
-    # Tier 1: iCal
+    # Tier 1: iCal (single collection-level feed)
     ical_url = _detect_ical(html, url, no_ical=no_ical)
     if ical_url:
         events = _parse_ical(ical_url, source, city_slug, city_name, tz_name)
         if events:
             log.info("[%s] iCal: %d events", source.get("name"), len(events))
             return events
+
+    # Tier 1.5: multiple per-event iCal exports. Squarespace event
+    # collections (confirmed on Riverside Revival) don't expose a single
+    # calendar-level feed the way Tier 1 looks for -- but every individual
+    # event carries its own "?format=ical" export link right on the
+    # listing page. Tier 1's _detect_ical deliberately ignores those
+    # (a lone per-event link should never be mistaken for a full-calendar
+    # feed) -- this tier is the deliberate "yes, and": if MANY per-event
+    # ical links share the same parent path, that's a strong signal this
+    # whole page is exactly that kind of listing, so fetch each one.
+    if not no_ical:
+        event_ical_urls = _detect_multi_ical(html, url)
+        if event_ical_urls:
+            events = _parse_multi_ical(event_ical_urls, source, city_slug, city_name, tz_name)
+            if events:
+                log.info("[%s] Multi-iCal: %d events from %d per-event feeds",
+                         source.get("name"), len(events), len(event_ical_urls))
+                return events
 
     # Tier 2: JSON-LD
     events = _parse_jsonld(html, source, city_slug, city_name)
@@ -195,7 +290,8 @@ def _scrape_html_auto(source: dict, city_slug: str, city_name: str,
 
 
 def _detect_ical(html: str, base_url: str, no_ical: bool = False):
-    """Find a calendar-level iCal feed. Ignores individual event ICS links."""
+    """Find a calendar-level iCal feed. Ignores individual event ICS links --
+    see _detect_multi_ical for how those are handled instead."""
     if no_ical:
         return None
     from urllib.parse import urlparse
@@ -213,6 +309,74 @@ def _detect_ical(html: str, base_url: str, no_ical: bool = False):
             if depth <= 1:
                 return abs_href
     return None
+
+
+def _detect_multi_ical(html: str, base_url: str, min_links: int = 3):
+    """
+    Detect a Squarespace-style events collection: many individual event
+    pages each exposing their own "?format=ical" (or "*.ics") export
+    link, all sharing the same immediate parent path (i.e. siblings in
+    the same collection), rather than one link scattered somewhere
+    unrelated on the page.
+
+    min_links guards against a page that just happens to have one or two
+    stray ".ics" links (e.g. a single "add this one event to your
+    calendar" button) -- that's not "the whole page is a listing of
+    these," just isolated confetti, and shouldn't trigger a bulk fetch.
+
+    Returns a list of absolute per-event iCal URLs, or [] if nothing
+    qualifies.
+    """
+    from urllib.parse import urlparse
+    soup = BeautifulSoup(html, "html.parser")
+    hits: dict[str, list[str]] = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "format=ical" not in href and not href.endswith(".ics"):
+            continue
+        abs_href = _abs(href, base_url)
+        path     = urlparse(abs_href).path.rstrip("/")
+        parts    = [p for p in path.split("/") if p]
+        if len(parts) < 2:
+            continue  # calendar-level -- _detect_ical already handles this case
+        parent_path = "/".join(parts[:-1])
+        hits.setdefault(parent_path, []).append(abs_href)
+
+    if not hits:
+        return []
+    _parent_path, links = max(hits.items(), key=lambda kv: len(kv[1]))
+    if len(links) < min_links:
+        return []
+    # de-dupe while preserving order (a page can link the same event's
+    # ICS export more than once -- e.g. once from a thumbnail, once from
+    # a "add to calendar" button)
+    seen, ordered = set(), []
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            ordered.append(link)
+    return ordered
+
+
+# Backstop: a listing page detected as having more than this many
+# individual per-event ICS links to fetch one-by-one is either
+# mis-detected or genuinely needs a real calendar-level feed found some
+# other way -- don't hammer the site fetching that many individual pages
+# every scrape cycle.
+MAX_MULTI_ICAL_EVENTS = 75
+
+
+def _parse_multi_ical(urls: list, source: dict, city_slug: str, city_name: str,
+                      tz_name: str = None) -> list[dict]:
+    events = []
+    for ical_url in urls[:MAX_MULTI_ICAL_EVENTS]:
+        events.extend(_parse_ical(ical_url, source, city_slug, city_name, tz_name))
+        # Same courtesy delay already used between paginated requests
+        # elsewhere in this file (TEC REST, JSON API) -- we're about to
+        # make up to MAX_MULTI_ICAL_EVENTS individual requests to the
+        # same host back-to-back.
+        time.sleep(0.3)
+    return events
 
 
 def _fetch_og_image(url: str) -> str:
@@ -234,8 +398,7 @@ def _fetch_og_image(url: str) -> str:
     if not url:
         return ""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
+        resp = _request_get(url, headers=HEADERS, timeout=10, retries=1)
         soup = BeautifulSoup(resp.text, "html.parser")
         tag  = soup.find("meta", {"property": "og:image"})
         if tag and tag.get("content"):
@@ -255,8 +418,8 @@ def _parse_ical(ical_url: str, source: dict, city_slug: str, city_name: str,
         except Exception:
             local_tz = ZoneInfo("UTC")
 
-        resp = requests.get(ical_url, headers=_headers_for(source), timeout=TIMEOUT)
-        resp.raise_for_status()
+        resp = _request_get(ical_url, headers=_headers_for(source), timeout=TIMEOUT,
+                             source_name=source.get("name", ""))
         cal    = Calendar.from_ical(resp.content)
         events = []
         for comp in cal.walk():
@@ -285,7 +448,7 @@ def _parse_ical(ical_url: str, source: dict, city_slug: str, city_name: str,
             end = edt.strftime("%Y-%m-%d %H:%M:%S")
 
             events.append(_ev(
-                title=title,
+                title=_clean_title(title),
                 description=str(comp.get("DESCRIPTION", "")).strip(),
                 start_date=start, end_date=end,
                 venue_name=str(comp.get("LOCATION", source.get("name", ""))).strip(),
@@ -320,12 +483,29 @@ def _parse_jsonld(html: str, source: dict, city_slug: str, city_name: str) -> li
         items = data if isinstance(data, list) else [data]
         if isinstance(data, dict) and "@graph" in data:
             items = data["@graph"]
+
+        # Multi-day festivals/series sometimes nest individual dates under
+        # a parent Event's "subEvent" array instead of listing them as
+        # top-level Event objects. Flatten those in too, so a single
+        # umbrella listing doesn't silently collapse into one entry (or
+        # get skipped for missing a usable startDate on the parent).
+        expanded = []
+        for item in items:
+            if isinstance(item, dict) and "Event" in str(item.get("@type", "")):
+                expanded.append(item)
+                sub = item.get("subEvent")
+                if isinstance(sub, dict):
+                    sub = [sub]
+                if isinstance(sub, list):
+                    expanded.extend(s for s in sub if isinstance(s, dict))
+        items = expanded or items
+
         for item in items:
             if not isinstance(item, dict):
                 continue
             if "Event" not in str(item.get("@type", "")):
                 continue
-            title     = item.get("name", "").strip()
+            title     = _clean_title(item.get("name", "").strip())
             start_raw = item.get("startDate", "")
             if not title or not start_raw:
                 continue
@@ -376,13 +556,28 @@ _LOOSE_DATE_RE = re.compile(
 # Full month name + day + 4-digit year, no day-of-week prefix (e.g. Ryman/
 # AXS-style "June 19, 2026 7:00 PM"). Distinct from _LOOSE_DATE_RE above,
 # which requires a leading day-of-week and has no year of its own (used
-# for Etix-style "Thu, Jun 18" dates that need _infer_year anchoring
+# for Etix-style "Thu, Jun 18" dates that need year-inference anchoring
 # instead). This pattern already carries its own year, so no inference
 # is needed when it matches.
 _LOOSE_DATE_WITH_YEAR_RE = re.compile(
     r"\b(?:January|February|March|April|May|June|July|August|September|"
     r"October|November|December)\s+\d{1,2},?\s+\d{4}"
     r"(?:\s+\d{1,2}:\d{2}\s*(?:am|pm))?\b",
+    re.IGNORECASE,
+)
+
+# Date RANGE with a single trailing year, e.g. "June 26 - July 19, 2026"
+# or "May 30 - August 8, 2026" (Parker Arts-style season/exhibit runs).
+# Without this, _LOOSE_DATE_WITH_YEAR_RE above would match the trailing
+# "July 19, 2026" fragment instead -- silently picking the LAST day of
+# the run as an event's start_date instead of the first, which is wrong
+# for anything that isn't a single-day show (multi-week exhibits,
+# extended musical/theater runs, festival date spans).
+_DATE_RANGE_RE = re.compile(
+    r"\b((?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+\d{1,2})\s*[-–—]\s*"
+    r"(?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+\d{1,2},?\s+(\d{4})\b",
     re.IGNORECASE,
 )
 
@@ -416,6 +611,10 @@ _TICKET_LINK_PRIORITY = ("buy ticket", "free show", "get ticket", "ticket", "rsv
 # document-order walk in _parse_heuristic.
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
+# CSS background-image url(...) -- fallback image source for sites that
+# render posters as a div's background-image instead of a real <img>.
+_BG_IMAGE_RE = re.compile(r"background-image:\s*url\(\s*['\"]?(.*?)['\"]?\s*\)", re.IGNORECASE)
+
 
 def _section_anchor_date(month_name: str, year: str):
     """Build a default datetime anchored to the 1st of the given month/year,
@@ -427,21 +626,88 @@ def _section_anchor_date(month_name: str, year: str):
         return None
 
 
+def _year_inferred_default(date_str: str):
+    """
+    Build a default anchor datetime for a date string that has no year of
+    its own (e.g. "Thu, Jun 18" or "FRIDAY, JULY 17"), by rolling forward
+    to next year if the month has already passed relative to today.
+
+    Shared by _parse_rhp and _parse_heuristic (previously each had its own
+    inline copy of this logic; _scrape_seetickets still builds the
+    equivalent string directly via _infer_year() since its date text
+    already comes pre-split into separate month/day tokens rather than a
+    single string to re-parse).
+
+    Returns None if date_str already contains an explicit 4-digit year
+    (in which case the string's own year should win), or has no
+    recognizable month name at all (in which case _parse_fuzzy_date's
+    sentinel-date safety rail should do its job and reject it outright
+    rather than have us hand it a made-up anchor).
+    """
+    if not date_str or re.search(r"\b\d{4}\b", date_str):
+        return None
+    month_match = re.search(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)",
+        date_str, re.IGNORECASE
+    )
+    if not month_match:
+        return None
+    year = _infer_year(month_match.group(1)[:3].title())
+    return datetime(year, 1, 1)
+
+
+def _nearby_sibling_anchor(tag, max_hops: int = 3):
+    """
+    For headings with no <a> of their own, look up to `max_hops` siblings
+    in each direction for the nearest element containing a real link.
+
+    Covers the "poster image links to the event's detail page, plain-text
+    heading sits right after it, TICKETS link sits right after that"
+    pattern -- confirmed on Graceland Live (Wix, no semantic event/card
+    classes, no schema.org markup, heading is a bare <h1>/<h1>-equivalent
+    with no inner link at all). Without this, _fallback_heading_containers
+    silently produces zero candidates on markup shaped this way, since it
+    only ever checked inside the heading tag itself.
+    """
+    for direction in (tag.find_previous_siblings, tag.find_next_siblings):
+        hop = 0
+        for sib in direction():
+            hop += 1
+            if hop > max_hops:
+                break
+            if getattr(sib, "name", None) in _HEADING_TAGS:
+                break  # ran into the previous/next event's heading -- stop
+            # The sibling can EITHER be the anchor itself (e.g. Graceland's
+            # poster image is directly "<a href=...><img/></a>", a sibling
+            # of the heading, not a container wrapping one) OR a container
+            # that has an anchor somewhere inside it -- check both, anchor-
+            # itself first since that's the more common real-world shape.
+            if getattr(sib, "name", None) == "a" and sib.get("href"):
+                return sib
+            found = sib.find("a", href=True) if hasattr(sib, "find") else None
+            if found:
+                return found
+    return None
+
+
 def _fallback_heading_containers(soup) -> list:
     """
     Last-resort container detection for sites whose markup doesn't match
     any known event-card class pattern (e.g. Etix-rendered venue calendars
     like Hi Tone Cafe, which use plain h2/h3 headings linking to event
-    detail pages with no 'event'/'card'-style class names at all).
+    detail pages with no 'event'/'card'-style class names at all; or
+    Wix-built sites like Graceland Live, whose headings have no link
+    inside them at all -- see _nearby_sibling_anchor).
 
-    Heuristic: an event listing heading is an h1-h4 wrapping (or directly
-    followed by) a link, repeated many times down the page, where most of
-    the link hrefs share a common path segment (e.g. "/event/"). We use the
-    heading's parent element as the container so date text and ticket
-    links sitting alongside the title are still reachable by the normal
-    extraction code below.
+    Heuristic: an event listing heading is an h1-h4 either wrapping (or
+    directly followed by) a link, OR sitting immediately next to one
+    (poster image / "TICKETS" button), repeated many times down the
+    page, where most of the link hrefs share a common path segment (e.g.
+    "/event/"). We use the heading's parent element as the container so
+    date text and ticket links sitting alongside the title are still
+    reachable by the normal extraction code below.
     """
-    candidates = []
+    candidates = []  # (tag, href, is_orphan)
     for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
         heading_text = tag.get_text(strip=True)
         if _MONTH_YEAR_RE.fullmatch(heading_text):
@@ -460,9 +726,15 @@ def _fallback_heading_containers(soup) -> list:
         if tag.find_parent(["nav", "footer", "header"]):
             continue
         a = tag.find("a", href=True)
+        is_orphan = False
         if not a:
-            continue  # only trust a link INSIDE the heading itself
-        candidates.append((tag, a["href"]))
+            # Orphan heading (no inner link) -- check nearby siblings
+            # before giving up on this candidate entirely.
+            a = _nearby_sibling_anchor(tag)
+            is_orphan = True
+        if not a:
+            continue
+        candidates.append((tag, a["href"], is_orphan))
 
     if len(candidates) < 3:
         return []
@@ -484,23 +756,43 @@ def _fallback_heading_containers(soup) -> list:
     from urllib.parse import urlparse
     from collections import Counter
     seg_counts = Counter()
-    for _, href in candidates:
+    for _, href, _is_orphan in candidates:
         path = urlparse(href).path
         parts = [p for p in path.split("/") if p]
         if parts:
             seg_counts[parts[0]] += 1
-    if not seg_counts:
-        return []
-    top_seg, top_count = seg_counts.most_common(1)[0]
-    if top_count < max(3, len(candidates) * 0.5):
-        return []
+
+    threshold = max(3, len(candidates) * 0.5)
+    top_seg, top_count = (seg_counts.most_common(1)[0] if seg_counts else (None, 0))
+
+    if seg_counts and top_count >= threshold:
+        selected = [
+            (tag, href) for tag, href, _is_orphan in candidates
+            if ([p for p in urlparse(href).path.split("/") if p] or [None])[0] == top_seg
+        ]
+    else:
+        # Flat-slug sites (confirmed on Graceland Live, a Wix site whose
+        # event hrefs are top-level -- "/elmiene", "/deanz" -- with no
+        # shared path segment to vote on at all) can never clear the
+        # majority-vote check above by design; there's nothing to share.
+        #
+        # For candidates found via the ORPHAN path specifically (a nearby
+        # sibling anchor, not a link inside the heading itself), the
+        # detection signal is already meaningful on its own: a heading
+        # that isn't a month/year divider, isn't inside nav/footer/header,
+        # and sits within 3 siblings of a real link -- repeated 3+ times
+        # down the page. That's enough to trust without ALSO requiring a
+        # shared URL path segment, since flat-slug sites structurally
+        # can't provide one. Regular (non-orphan) candidates still need
+        # to clear the segment vote as before -- this relaxation is
+        # scoped to the orphan case only.
+        orphan_only = [(tag, href) for tag, href, is_orphan in candidates if is_orphan]
+        if len(orphan_only) < 3:
+            return []
+        selected = orphan_only
 
     containers = []
-    for tag, href in candidates:
-        path = urlparse(href).path
-        parts = [p for p in path.split("/") if p]
-        if not parts or parts[0] != top_seg:
-            continue
+    for tag, href in selected:
         container = _synthetic_container(tag, soup, href=href)
         container._tlr_anchor = _nearest_preceding_anchor(tag)
         containers.append(container)
@@ -540,10 +832,14 @@ def _synthetic_container(heading_tag, soup, href=""):
     AXS-style pages (e.g. Ryman Auditorium) put date/venue text in plain
     <p> tags BEFORE an image-wrapping link, which is itself before the
     heading -- multiple preceding siblings deep, not just the one
-    immediately before the heading. The old version of this function only
-    ever checked a single immediately-preceding sibling, which silently
-    dropped that date/venue text for sites shaped this way. Walking ALL
-    preceding siblings back to the container boundary covers both cases.
+    immediately before the heading.
+
+    Wix-style pages (e.g. Graceland Live) put the poster-image link BEFORE
+    the (linkless) heading and a "TICKETS" link AFTER it, with the date
+    text as a following sibling too -- covered by the same "walk all
+    preceding/following siblings to the next heading boundary" approach,
+    no special-casing needed beyond _nearby_sibling_anchor finding the
+    candidate href in the first place.
     """
     wrapper = soup.new_tag("div")
 
@@ -689,16 +985,10 @@ def _parse_rhp(html: str, base_url: str, source: dict,
         if time_match:
             date_str = f"{date_str} {time_match.group(1)}"
 
-        # No year in "Fri, Jun 19" — anchor using the same forward-rolling
-        # logic as the rest of the file (infer next year if the month has
-        # already passed relative to today).
-        month_match = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", date_str, re.IGNORECASE)
-        default_dt  = None
-        if month_match and not re.search(r"\b\d{4}\b", date_str):
-            year = _infer_year(month_match.group(1)[:3].title())
-            default_dt = datetime(year, 1, 1)
-
-        start_date = _parse_fuzzy_date(date_str, default=default_dt)
+        # No year in "Fri, Jun 19" — anchor using the shared year-rollover
+        # helper (infer next year if the month has already passed
+        # relative to today).
+        start_date = _parse_fuzzy_date(date_str, default=_year_inferred_default(date_str))
         if not start_date:
             continue
 
@@ -728,7 +1018,7 @@ def _parse_rhp(html: str, base_url: str, source: dict,
         desc    = desc_el.get_text(strip=True) if desc_el else ""
 
         events.append(_ev(
-            title=title, description=desc,
+            title=_clean_title(title), description=desc,
             start_date=start_date, end_date=start_date,
             venue_name=source.get("name", ""),
             ticket_url=ticket_url, source=source,
@@ -809,22 +1099,37 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
         # itself (e.g. "DIY Memphis Presents: [Big Room] Thu, Jun 18").
         # Strip it so the title field doesn't carry date junk — the real
         # date is recovered separately below from the same text or a
-        # sibling link.
-        title = _TRAILING_DATE_RE.sub("", title).strip()
+        # sibling link. Also strip common ticketing-platform boilerplate
+        # suffixes ("... - Tickets", "... | Ticketmaster").
+        title = _clean_title(_TRAILING_DATE_RE.sub("", title).strip())
+
+        full_text = c.get_text(" ", strip=True)
+
+        # Date range check FIRST ("June 26 - July 19, 2026") -- takes
+        # priority over everything below except an explicit machine-
+        # readable datetime="" attribute, since a naive text-scan against
+        # range text has the same wrong-end-of-range risk whether it comes
+        # from a <time>/[class*='date'] element or the loose full-text
+        # scan further down.
+        range_match = _DATE_RANGE_RE.search(full_text)
 
         # Date: prefer <time datetime="..."> attribute, fall back to visible text
         date_el  = c.select_one("time,[class*='date']")
         date_str = ""
         if date_el:
             date_str = date_el.get("datetime") or date_el.get_text(strip=True)
+
+        if range_match and not (date_el and date_el.get("datetime")):
+            date_str = f"{range_match.group(1)}, {range_match.group(2)}"
+
         if not date_str:
-            # No <time>/date-class element — scan the container's text for
-            # a date-shaped fragment (e.g. "Thu, Jun 18") and append the
-            # event's actual start time so the fuzzy parser has both a
-            # date and a time to work with. Prefer "Show:" over "Doors:"
-            # since the show time is what people actually want to know —
-            # doors is just when the venue opens.
-            full_text = c.get_text(" ", strip=True)
+            # No <time>/date-class element and no range match — scan the
+            # container's text for a date-shaped fragment (e.g. "Thu, Jun
+            # 18") and append the event's actual start time so the fuzzy
+            # parser has both a date and a time to work with. Prefer
+            # "Show:" over "Doors:" since the show time is what people
+            # actually want to know — doors is just when the venue opens.
+            #
             # Try the year-bearing pattern first (e.g. "June 19, 2026 7:00
             # PM") -- it's typically already a complete, parseable
             # date+time string on its own, no Show:/Doors: time-appending
@@ -842,13 +1147,28 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
                     if time_match:
                         date_str = f"{date_str} {time_match.group(1)}"
 
-        # Image: src or data-src; strip Squarespace CDN query params
+        # Image: src/data-src/srcset, or a CSS background-image as a last
+        # resort (some sites -- confirmed pattern on a handful of venue
+        # sites using CSS-driven poster grids -- render the poster as a
+        # div background rather than a real <img> at all). Strip
+        # Squarespace CDN query params either way.
         img_el    = c.find("img")
         image_url = ""
         if img_el:
-            image_url = img_el.get("src") or img_el.get("data-src") or ""
-            if "squarespace-cdn.com" in image_url and "?" in image_url:
-                image_url = image_url.split("?")[0]
+            image_url = (img_el.get("src") or img_el.get("data-src")
+                         or img_el.get("data-lazy-src") or "")
+            if not image_url:
+                srcset = img_el.get("srcset") or img_el.get("data-srcset") or ""
+                if srcset:
+                    image_url = srcset.split(",")[0].strip().split(" ")[0]
+        if not image_url:
+            bg_el = c.select_one("[style*='background-image']")
+            if bg_el:
+                m = _BG_IMAGE_RE.search(bg_el.get("style", ""))
+                if m:
+                    image_url = m.group(1)
+        if "squarespace-cdn.com" in image_url and "?" in image_url:
+            image_url = image_url.split("?")[0]
 
         # Ticket link: rank candidates by keyword priority so "Buy Tickets"/
         # "Free Show" always wins over "RSVP" (a Facebook event link, not a
@@ -881,7 +1201,7 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
         # required for parsing — purely informational — so a miss here
         # never affects the date quality gate below.
         cost_text = ""
-        price_match = _PRICE_RE.search(c.get_text(" ", strip=True))
+        price_match = _PRICE_RE.search(full_text)
         if price_match:
             low, high = price_match.group(1), price_match.group(2)
             cost_text = f"${low} to ${high}" if high else f"${low}"
@@ -900,8 +1220,15 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
     if not raw_events:
         return []
 
-    # Quality gate: bail to Ollama if too many dates fail to parse
-    parsed_dates = [_parse_fuzzy_date(r["date_str"], default=r["anchor"]) for r in raw_events]
+    # Quality gate: bail to Ollama if too many dates fail to parse.
+    # Anchor priority: an explicit month/year section-heading anchor (if
+    # this container sat under one) wins; otherwise fall back to rolling
+    # forward from the date string's own month name (e.g. "FRIDAY, JULY
+    # 17" with no section heading at all, as on Graceland Live).
+    parsed_dates = [
+        _parse_fuzzy_date(r["date_str"], default=r["anchor"] or _year_inferred_default(r["date_str"]))
+        for r in raw_events
+    ]
     fail_count   = sum(1 for d in parsed_dates if not d)
     if len(raw_events) > 0 and fail_count / len(raw_events) >= 0.5:
         log.info("[%s] Heuristic quality gate: %d/%d dates failed — falling to Ollama",
@@ -954,11 +1281,25 @@ def _ollama_extract(html: str, source: dict, city_slug: str, city_name: str) -> 
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)[:6000]
 
+        # Today's date anchor: without this, the model has no way to
+        # infer a year on sites whose visible text never states one
+        # (e.g. Graceland Live's "FRIDAY, JULY 17") and is exposed to
+        # exactly the same silent mis-dating risk that the sentinel-date
+        # safety rail in _parse_fuzzy_date exists to catch in the
+        # heuristic tier -- except tier 4 had no equivalent protection at
+        # all before this.
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         prompt = (
-            f"Extract all upcoming events from this page for {source.get('name')} in {city_name}.\n"
+            f"Today's date is {today_str}. Extract all UPCOMING events "
+            f"(on or after today's date) from this page for "
+            f"{source.get('name')} in {city_name}.\n"
             "Return a JSON array. Each object must have exactly these keys:\n"
             "title, description, start_date (YYYY-MM-DD HH:MM:SS), end_date, "
             "venue_name, ticket_url, cost, image_url.\n"
+            "If a date has no explicit year stated, assume the NEXT occurrence "
+            "of that month/day on or after today's date -- never a date in "
+            "the past relative to today.\n"
             "Use empty string for unknown fields. Return ONLY valid JSON.\n\n"
             f"{text}"
         )
@@ -976,7 +1317,7 @@ def _ollama_extract(html: str, source: dict, city_slug: str, city_name: str) -> 
 
         events = []
         for item in extracted:
-            title = (item.get("title") or "").strip()
+            title = _clean_title((item.get("title") or "").strip())
             if not title:
                 continue
             events.append(_ev(
@@ -1001,8 +1342,7 @@ def _ollama_extract(html: str, source: dict, city_slug: str, city_name: str) -> 
 def _scrape_seetickets(source: dict, city_slug: str, city_name: str) -> list[dict]:
     url = source["url"]
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
+        resp = _request_get(url, headers=HEADERS, timeout=TIMEOUT, source_name=source.get("name", ""))
     except Exception as e:
         log.warning("SeeTickets fetch failed for %s: %s", source.get("name"), e)
         return []
@@ -1078,7 +1418,7 @@ def _scrape_seetickets(source: dict, city_slug: str, city_name: str) -> list[dic
         seen.add(key)
 
         events.append(_ev(
-            title=title,
+            title=_clean_title(title),
             description=" | ".join(desc_parts),
             start_date=start_date, end_date=start_date,
             venue_name=source.get("venue_name", source.get("name", "")),
@@ -1164,8 +1504,8 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
 
     while params["page"] <= MAX_PAGES:
         try:
-            resp = requests.get(api_url, params=params, headers=HEADERS, timeout=TIMEOUT)
-            resp.raise_for_status()
+            resp = _request_get(api_url, params=params, headers=HEADERS, timeout=TIMEOUT,
+                                 source_name=source.get("name", ""))
             data = resp.json()
         except Exception as e:
             log.warning("TEC REST error page %d for %s: %s", params["page"], source.get("name"), e)
@@ -1191,6 +1531,7 @@ def _scrape_tec_rest(source: dict, city_slug: str, city_name: str) -> list[dict]
                 _tec_rendered_text(item.get("title", "")),
                 "html.parser"
             ).get_text(strip=True)
+            title = _clean_title(title)
             if not title:
                 continue
             desc  = BeautifulSoup(
@@ -1247,8 +1588,8 @@ def _scrape_json_api(source: dict, city_slug: str, city_name: str) -> list[dict]
     for page in range(1, max_pages + 1):
         url = api_url.format(page=page)
         try:
-            resp = requests.get(url, headers={**HEADERS, "Accept": "application/json"}, timeout=TIMEOUT)
-            resp.raise_for_status()
+            resp = _request_get(url, headers={**HEADERS, "Accept": "application/json"},
+                                 timeout=TIMEOUT, source_name=source.get("name", ""))
             data = resp.json()
         except Exception as e:
             log.warning("JSON API page %d failed for %s: %s", page, source.get("name"), e)
@@ -1266,7 +1607,7 @@ def _scrape_json_api(source: dict, city_slug: str, city_name: str) -> list[dict]
             break
 
         for raw in raw_list:
-            title = (raw.get("title") or raw.get("name") or raw.get("event_name") or "").strip()
+            title = _clean_title((raw.get("title") or raw.get("name") or raw.get("event_name") or "").strip())
             if not title:
                 continue
             desc = BeautifulSoup(
@@ -1304,8 +1645,8 @@ def _scrape_json_api(source: dict, city_slug: str, city_name: str) -> list[dict]
 
 def _scrape_generic_html(source: dict, city_slug: str, city_name: str) -> list[dict]:
     try:
-        resp = requests.get(source["url"], headers=HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
+        resp = _request_get(source["url"], headers=HEADERS, timeout=TIMEOUT,
+                             source_name=source.get("name", ""))
     except Exception as e:
         log.warning("Generic HTML fetch failed for %s: %s", source.get("name"), e)
         return []
@@ -1325,7 +1666,7 @@ def _scrape_generic_html(source: dict, city_slug: str, city_name: str) -> list[d
                 if not te or not te.get_text(strip=True):
                     continue
                 events.append(_ev(
-                    title=te.get_text(strip=True),
+                    title=_clean_title(te.get_text(strip=True)),
                     description=de2.get_text(separator=" ", strip=True) if de2 else "",
                     start_date=_parse_fuzzy_date(de.get_text(strip=True) if de else ""),
                     end_date="",
@@ -1379,7 +1720,7 @@ def _parse_fuzzy_date(text: str, default=None) -> str:
     of the year and then quietly mis-dates events once you cross a
     year/month boundary between scrape time and event time. Always pass
     an explicit default when one is available (see _section_anchor_date
-    in _parse_heuristic).
+    and _year_inferred_default above).
 
     SAFETY RULE (added 2026-06-30 — Larimer Lounge incident): if no
     `default` is supplied, this function refuses to let dateutil borrow
@@ -1436,11 +1777,12 @@ def _abs(href: str, base_url: str) -> str:
 #   venv/bin/python3 scraper.py <url>
 #
 # No quoting/heredoc gymnastics needed — just one argument. Prints raw HTML
-# stats, whether the known event-card CSS selectors matched anything, what
-# _fallback_heading_containers found (or why it bailed), and the actual
-# extracted events if any tier succeeds. Does NOT hit Ollama — this is for
-# diagnosing tiers 1-3 only, since tier 4 is slow/expensive and not what's
-# usually broken.
+# stats, which tier (if any) would fire and why, whether the known
+# event-card CSS selectors matched anything, what _fallback_heading_
+# containers found (including orphan-heading matches) or why it bailed,
+# and the actual extracted events if any tier succeeds. Does NOT hit
+# Ollama — this is for diagnosing tiers 1-3 only, since tier 4 is
+# slow/expensive and not what's usually broken.
 
 if __name__ == "__main__":
     import sys as _sys
@@ -1468,7 +1810,20 @@ if __name__ == "__main__":
         print(html[max(0, idx - 1000): idx + 2000])
         print()
 
-    print("\n=== Known CSS selector tiers (_EVENT_SELECTORS) ===")
+    print("=== Tier 1: single calendar-level iCal feed ===")
+    ical_hit = _detect_ical(html, debug_url)
+    print(f"_detect_ical: {ical_hit!r}\n")
+
+    print("=== Tier 1.5: multiple per-event iCal exports (Squarespace-style) ===")
+    multi_ical_hits = _detect_multi_ical(html, debug_url)
+    print(f"_detect_multi_ical: {len(multi_ical_hits)} links found")
+    for link in multi_ical_hits[:5]:
+        print(f"  {link}")
+    if len(multi_ical_hits) > 5:
+        print(f"  ... and {len(multi_ical_hits) - 5} more")
+    print()
+
+    print("=== Known CSS selector tiers (_EVENT_SELECTORS) ===")
     soup_dbg = BeautifulSoup(html, "html.parser")
     for sel in _EVENT_SELECTORS:
         found = soup_dbg.select(sel)
@@ -1484,6 +1839,7 @@ if __name__ == "__main__":
     print(f"Total h1-h4 tags on page: {len(headings)}")
 
     candidates = []
+    orphan_count = 0
     for tag in headings:
         heading_text = tag.get_text(strip=True)
         if _MONTH_YEAR_RE.fullmatch(heading_text):
@@ -1492,21 +1848,25 @@ if __name__ == "__main__":
             continue
         a = tag.find("a", href=True)
         if not a:
+            a = _nearby_sibling_anchor(tag)
+            if a:
+                orphan_count += 1
+        if not a:
             continue
         candidates.append((tag, a["href"]))
-    print(f"Headings containing a direct <a href> (and not a month/year divider, and not in nav/footer/header): {len(candidates)}")
+    print(f"Headings with a usable link (inner OR nearby-sibling) -- excluding month/year "
+          f"dividers and nav/footer/header: {len(candidates)}")
+    print(f"  of which found via nearby-sibling fallback (no link inside the heading itself): {orphan_count}")
     if candidates[:5]:
         print("First few candidate hrefs:")
         for _, href in candidates[:5]:
             print(f"  {href}")
 
     if len(candidates) < 3:
-        print("\nBAILED: fewer than 3 heading+link candidates found. "
-              "Real markup likely doesn't put an <a> directly inside the "
-              "h1-h4 tag — e.g. the link might wrap the heading instead of "
-              "containing it, or event titles might be in a different tag "
-              "(div, span) entirely. Inspect the snippet above to see the "
-              "actual structure.")
+        print("\nBAILED: fewer than 3 heading+link candidates found (even counting nearby-"
+              "sibling matches). Real markup likely doesn't put a link inside the h1-h4 tag "
+              "OR within 3 siblings of it either — inspect the snippet above for the actual "
+              "structure.")
     else:
         from collections import Counter
         from urllib.parse import urlparse
