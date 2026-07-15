@@ -54,6 +54,8 @@ import sys
 import time
 from urllib.parse import quote
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scraper  # noqa: E402  (must come after sys.path insert)
 
@@ -227,17 +229,27 @@ def _revisit_source(source: dict, city_slug: str) -> int:
 def _classify(source: dict) -> tuple:
     """PASS 2 (only reached if pass 1 found 0): returns (bucket, detail)
     explaining WHY. Never raises -- a classification failure is itself
-    just recorded as a bucket."""
+    just recorded as a bucket.
+
+    Deliberately uses requests.get() directly here, NOT scraper._request_get().
+    _request_get() raises immediately on a plain 403/404/etc (the right
+    behavior for production scraping, where a 4xx genuinely means "give
+    up"), but this function's entire job is to READ the status code, not
+    have it thrown away as an exception before we get a chance to look at
+    it -- that was a real bug caught while testing this script (a 403
+    during classification was being mislabeled as
+    dead_domain_or_connection_error instead of getting the browser_ua/
+    html_relay check it needed).
+    """
     name, url = source["name"], source["url"]
 
     if not url:
         return ("no_url_configured", "no fix possible without adding a URL")
 
     try:
-        resp = scraper._request_get(url, headers=scraper.HEADERS, timeout=15,
-                                     retries=1, source_name=name)
+        resp = requests.get(url, headers=scraper.HEADERS, timeout=15)
         plain_status, plain_len, plain_html = resp.status_code, len(resp.content), resp.text
-    except Exception as e:
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
         return ("dead_domain_or_connection_error", f"{type(e).__name__}: {e}")
 
     if plain_status == 200:
@@ -247,13 +259,12 @@ def _classify(source: dict) -> tuple:
 
     if plain_status in (403, 406, 429):
         try:
-            resp2 = scraper._request_get(url, headers=scraper.BROWSER_HEADERS,
-                                          timeout=15, retries=1, source_name=name)
+            resp2 = requests.get(url, headers=scraper.BROWSER_HEADERS, timeout=15)
             if resp2.status_code == 200:
                 return ("needs_browser_ua", f"plain UA={plain_status}, browser UA=200")
             return ("needs_html_relay", f"blocked on both plain ({plain_status}) "
                                          f"and browser UA ({resp2.status_code}) -- ASN/IP block")
-        except Exception as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             return ("needs_html_relay", f"plain UA={plain_status}, browser UA fetch also failed: {e}")
 
     return ("other_http_status", f"HTTP {plain_status}")
@@ -297,9 +308,25 @@ def main():
         try:
             count = _revisit_source(source, row["city_slug"])
         except Exception as e:
-            buckets.setdefault("dead_domain_or_connection_error", []).append(
-                (row["name"], row["city_slug"], f"{type(e).__name__}: {e}"))
-            print(f"{label} -> dead_domain_or_connection_error")
+            # IMPORTANT: an HTTPError means we got a real response from a
+            # real server, just a non-2xx one (403 blocked, 404 moved,
+            # etc.) -- that's exactly the case _classify() knows how to
+            # investigate further (browser_ua vs html_relay vs genuine
+            # other-status). Only a true connection-level failure (DNS
+            # resolution, refused connection, timeout with no response at
+            # all) means the domain itself is actually unreachable. Catching
+            # both the same way here previously buried real 403-blocked
+            # sources in "dead_domain_or_connection_error" instead of
+            # giving them the same shot at needs_browser_ua/needs_html_relay
+            # that Parker Arts got.
+            if isinstance(e, requests.exceptions.HTTPError):
+                bucket, detail = _classify(source)
+                buckets.setdefault(bucket, []).append((row["name"], row["city_slug"], detail))
+                print(f"{label} -> still 0 (HTTP error on re-scrape), classified as: {bucket}")
+            else:
+                buckets.setdefault("dead_domain_or_connection_error", []).append(
+                    (row["name"], row["city_slug"], f"{type(e).__name__}: {e}"))
+                print(f"{label} -> dead_domain_or_connection_error")
             time.sleep(args.delay)
             continue
 
