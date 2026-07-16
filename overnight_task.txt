@@ -1,0 +1,18 @@
+Overnight task. Read-only investigation and proposal-writing ONLY. Follow these hard boundaries:
+
+DO NOT:
+- Run any UPDATE, DELETE, or INSERT against the MySQL database, for any reason
+- Overwrite or edit /opt/openclaw/scraper.py directly
+- Deploy, restart, or touch the openclaw service
+- Touch merge_fuzzy_dupes.py, the dedup logic, or run any dedup/merge pass
+- Fire any source through the Monitor
+- Change any source's notes, source_type, or status field
+
+DO:
+1. Run triage_rejected_sources.py across ALL cities (no --city filter), full run, to get the current real picture with tonight's fixes already live.
+2. For every source landing in markup_not_matched, investigate root cause the same way we did for Dzire Bar, TicketWeb, and Nashville Superspeedway tonight: read the dumped HTML, identify the actual pattern, and check whether it's a GENERALIZABLE fix (helps multiple sources) or genuinely one-off.
+3. For anything you find a credible generalizable fix for: write the proposed code change to a NEW file (e.g. /opt/openclaw/proposed_fixes.md), including the diff, which sources it should help, and your confidence level. Do not apply it.
+4. Write a single summary file at /opt/openclaw/overnight_report.md covering: full triage results, proposed fixes found (with reasoning), any sources you're uncertain about, and a prioritized list for tomorrow.
+5. Stop after 2 hours of work regardless of progress, and make sure overnight_report.md reflects whatever state you're in at that point.
+
+Confirm you understand these boundaries before starting, then begin.
