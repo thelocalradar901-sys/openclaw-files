@@ -114,7 +114,17 @@ def _request_get(url, *, headers=None, params=None, timeout=TIMEOUT,
     for attempt in range(retries + 1):
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-            if resp.status_code == 429 or resp.status_code >= 500:
+            # 406 included alongside 429/5xx as retryable -- confirmed via
+            # rapid-fire identical requests against Ryman Auditorium's
+            # events_ajax endpoint that it intermittently flips between
+            # 200 and 406 on the SAME URL with the SAME headers, no
+            # consistent trigger tied to headers, rate, or timing. That's
+            # backend flakiness on their end, not a real "this request is
+            # unacceptable" signal -- treating it as permanent (the normal
+            # rule for 4xx) meant a single unlucky response aborted the
+            # entire ajax_paginate pagination loop instead of just
+            # retrying past it like any other transient failure.
+            if resp.status_code in (429, 406) or resp.status_code >= 500:
                 if attempt < retries:
                     wait = (2 ** attempt) + random.uniform(0, 0.5)
                     log.info("[%s] HTTP %d on attempt %d/%d for %s -- retrying in %.1fs",
