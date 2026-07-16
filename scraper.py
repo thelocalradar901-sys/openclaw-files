@@ -66,6 +66,31 @@ def _headers_for(source: dict) -> dict:
     return BROWSER_HEADERS if source.get("browser_ua") else HEADERS
 
 
+def _ajax_headers_for(source: dict) -> dict:
+    """
+    Headers for AJAX-endpoint fetches (see _scrape_ajax_paginate). A real
+    browser's own JS makes XHR/fetch calls with an X-Requested-With
+    header and a JSON-favoring Accept header, distinct from what it sends
+    for an ordinary page load.
+
+    Confirmed real-world trigger: Ryman Auditorium's events_ajax endpoint
+    returned 406 Not Acceptable to the normal page-navigation-shaped
+    Accept header used everywhere else in this file ("text/html,
+    application/xhtml+xml,*/*;q=0.9"), while the EXACT SAME URL succeeded
+    both for a real browser's XHR call and for a bare `curl` with no
+    Accept header override at all. That rules out an IP/ASN block (curl
+    succeeded from the same box) -- the specific "text/html first" Accept
+    header is what's triggering the server's content-negotiation
+    rejection, not the absence of browser-like headers in general.
+    """
+    base = _headers_for(source)
+    return {
+        **base,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
 # ── Network helper ────────────────────────────────────────────────────────────
 
 def _request_get(url, *, headers=None, params=None, timeout=TIMEOUT,
@@ -1828,7 +1853,7 @@ def _scrape_ajax_paginate(source: dict, city_slug: str, city_name: str) -> list[
         offset = page_num * per_page
         url = template.format(offset=offset)
         try:
-            resp = _request_get(url, headers=_headers_for(source), timeout=TIMEOUT,
+            resp = _request_get(url, headers=_ajax_headers_for(source), timeout=TIMEOUT,
                                 source_name=source.get("name", ""))
         except Exception as e:
             log.info("[%s] ajax_paginate stopped at offset %d: %s",

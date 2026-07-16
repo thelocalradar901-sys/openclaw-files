@@ -10,7 +10,7 @@ source = {
 url = source["ajax_url_template"].format(offset=0)
 print("Fetching:", url)
 
-resp = scraper._request_get(url, headers=scraper._headers_for(source), timeout=scraper.TIMEOUT, source_name="debug")
+resp = scraper._request_get(url, headers=scraper._ajax_headers_for(source), timeout=scraper.TIMEOUT, source_name="debug")
 print("HTTP status-ish OK, raw text length:", len(resp.text))
 print("First 200 chars of raw response:")
 print(repr(resp.text[:200]))
