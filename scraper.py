@@ -345,6 +345,17 @@ def _scrape_html_auto(source: dict, city_slug: str, city_name: str,
         log.info("[%s] JSON-LD: %d events", source.get("name"), len(events))
         return events
 
+    # Tier 2.2: AEG/AXS "Discovery" widget -- see _detect_axs_widget
+    # docstring below. Cheap regex check, so worth trying before the
+    # slower generic heuristic tier below (which will just find the
+    # widget's empty shell and correctly produce nothing anyway).
+    axs_feed = _detect_axs_widget(html)
+    if axs_feed:
+        events = _scrape_axs_widget(axs_feed, source, city_slug, city_name)
+        if events:
+            log.info("[%s] AXS widget feed: %d events", source.get("name"), len(events))
+            return events
+
     # Tier 2.5: RHP events plugin (seen on Hi Tone Cafe and possibly other
     # venue sites running the same WP plugin). Distinct, stable markup:
     # an <a id="eventTitle" class="url" href=".../event/.../"> WRAPS an
@@ -394,6 +405,62 @@ def _detect_ical(html: str, base_url: str, no_ical: bool = False):
             if depth <= 1:
                 return abs_href
     return None
+
+
+# AEG Presents' "Discovery" AXS ticketing widget (confirmed on Bluebird
+# Theatre, Gothic Theatre, Mission Ballroom, Ogden Theatre, The Pinnacle
+# - Nashville -- 2026-07-16 overnight triage) renders its event cards
+# entirely client-side; the raw fetched HTML only ever contains an empty
+# `c-axs-event-card__title--wrapper` template shell, which is why the
+# generic heuristic tier (which matches the selector fine) still finds 0
+# events -- there's no title/date text in the static markup at all. But
+# the same static page embeds a direct link to the venue's own JSON
+# events feed, hosted on a public/unauthenticated Azure blob path. No
+# headless render needed -- just fetch that URL directly.
+_AXS_EVENTS_JSON_RE = re.compile(
+    r"aegwebprod\.blob\.core\.windows\.net/json/events/(\d+)/events\.json"
+)
+
+
+def _detect_axs_widget(html: str):
+    m = _AXS_EVENTS_JSON_RE.search(html)
+    if not m:
+        return None
+    return f"https://aegwebprod.blob.core.windows.net/json/events/{m.group(1)}/events.json"
+
+
+def _scrape_axs_widget(feed_url: str, source: dict, city_slug: str, city_name: str) -> list[dict]:
+    try:
+        resp = _request_get(feed_url, headers=HEADERS, timeout=TIMEOUT,
+                             source_name=source.get("name", ""))
+        data = resp.json()
+    except Exception as e:
+        log.warning("[%s] AXS widget feed fetch/parse failed: %s", source.get("name"), e)
+        return []
+
+    events = []
+    for item in data.get("events", []):
+        if not item.get("active", True):
+            continue
+        title = _clean_title(((item.get("title") or {}).get("eventTitleText") or "").strip())
+        start_raw = item.get("eventDateTime")  # already local wall-clock time; see eventDateTimeZone
+        if not title or not start_raw:
+            continue
+        media = item.get("media") or {}
+        best_img = max(media.values(), key=lambda m: m.get("width", 0) * m.get("height", 0), default={})
+        ticketing = item.get("ticketing") or {}
+        events.append(_ev(
+            title=title,
+            description=(item.get("bio") or "").strip(),
+            start_date=_normalize_dt(start_raw),
+            end_date=_normalize_dt(start_raw),
+            venue_name=source.get("name", ""),
+            ticket_url=ticketing.get("url", "") or ticketing.get("eventUrl", ""),
+            source=source, city_slug=city_slug, city_name=city_name,
+            image_url=best_img.get("file_name", ""),
+            external_id=str(item.get("eventId", "")),
+        ))
+    return events
 
 
 def _detect_multi_ical(html: str, base_url: str, min_links: int = 3):
@@ -1063,24 +1130,38 @@ def _parse_rhp(html: str, base_url: str, source: dict,
         for cand in soup.find_all("a", href=True):
             if cand is a_tag:
                 continue
-            if cand.get("href") == href and cand.select_one("#eventDate, [class*='eventDate']"):
+            if cand.get("href") == href and cand.select_one("#eventDate"):
                 date_link = cand
                 break
         if date_link:
-            date_el  = date_link.select_one("#eventDate, [class*='eventDate']")
+            date_el  = date_link.select_one("#eventDate")
             date_str = date_el.get_text(strip=True) if date_el else ""
 
         if not date_str:
-            # Fallback: narrow search to the title link's own immediate
-            # row/column ancestors only (max 4 levels), never the whole
-            # page — keeps us from re-introducing the cross-event bleed
-            # this whole rewrite is fixing.
+            # Fallback: narrow search to the title link's own ancestors,
+            # capped at 8 levels (was 4 -- too shallow to reach the real
+            # #eventDate div, which lives in a SIBLING .rhp-event-thumb
+            # wrapper, not an ancestor of the title at all -- confirmed
+            # real bug on Larimer Lounge: the old 4-level cap only ever
+            # reached as far as a DIFFERENT div, `.eventDateDetails`
+            # (holds "Doors: X pm Show: Y pm" TIME text, not a date),
+            # which [class*='eventDate'] wrongly substring-matched.
+            # Guarded against re-introducing cross-event bleed the same
+            # way info_scope's climb already does a few lines below:
+            # stop the moment a second #eventTitle appears in scope,
+            # meaning we've crossed into a sibling event's markup. Uses
+            # "#eventDate" (ID, not the substring class selector) for
+            # the same reason as the two calls above -- eliminates the
+            # eventDateDetails collision at the source rather than
+            # working around it.
             scope = a_tag
-            for _ in range(4):
+            for _ in range(8):
                 if scope.parent is None:
                     break
                 scope = scope.parent
-                date_el = scope.select_one("#eventDate, [class*='eventDate']")
+                if len(scope.select("#eventTitle")) > 1:
+                    break
+                date_el = scope.select_one("#eventDate")
                 if date_el:
                     date_str = date_el.get_text(strip=True)
                     break
@@ -1436,7 +1517,8 @@ def _parse_heuristic(html: str, base_url: str, source: dict,
 def _ollama_extract(html: str, source: dict, city_slug: str, city_name: str) -> list[dict]:
     try:
         import json as _json
-        from config import OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_TIMEOUT
+        from config import OLLAMA_MODEL
+        from ollama_client import generate as _ollama_generate
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
@@ -1464,13 +1546,10 @@ def _ollama_extract(html: str, source: dict, city_slug: str, city_name: str) -> 
             "Use empty string for unknown fields. Return ONLY valid JSON.\n\n"
             f"{text}"
         )
-        resp = requests.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"},
-            timeout=OLLAMA_TIMEOUT,
+        data = _ollama_generate(
+            {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"}
         )
-        resp.raise_for_status()
-        raw = resp.json().get("response", "[]")
+        raw = data.get("response", "[]")
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         extracted = _json.loads(raw)
         if not isinstance(extracted, list):
@@ -1856,18 +1935,45 @@ def _scrape_ajax_paginate(source: dict, city_slug: str, city_name: str) -> list[
     # listing goes.
     MAX_PAGES = 20
 
+    # Ryman's ajax endpoint in particular has been observed going through
+    # multi-minute windows where it 406s every request regardless of
+    # headers/cookies, then recovering on its own. _request_get's normal
+    # retries (a couple seconds of backoff) are too short to ride that out,
+    # but bumping that global policy would slow down retries for every
+    # other source. So: a second-tier, ajax_paginate-local retry that waits
+    # long enough for a bad window to plausibly clear, capped so a source
+    # that's actually dead doesn't hang the whole scrape cycle.
+    PAGE_RETRY_ATTEMPTS = 2
+    PAGE_RETRY_DELAY_RANGE = (20, 30)
+
     events    = []
     seen_keys = set()
 
     for page_num in range(MAX_PAGES):
         offset = page_num * per_page
         url = template.format(offset=offset)
-        try:
-            resp = _request_get(url, headers=_ajax_headers_for(source), timeout=TIMEOUT,
-                                source_name=source.get("name", ""))
-        except Exception as e:
-            log.info("[%s] ajax_paginate stopped at offset %d: %s",
-                     source.get("name"), offset, e)
+
+        resp = None
+        last_err = None
+        for retry_num in range(PAGE_RETRY_ATTEMPTS + 1):
+            try:
+                resp = _request_get(url, headers=_ajax_headers_for(source), timeout=TIMEOUT,
+                                    source_name=source.get("name", ""))
+                break
+            except Exception as e:
+                last_err = e
+                if retry_num < PAGE_RETRY_ATTEMPTS:
+                    delay = random.uniform(*PAGE_RETRY_DELAY_RANGE)
+                    log.info("[%s] ajax_paginate offset %d failed (%s) -- "
+                             "waiting %.0fs for a possible bad window to clear "
+                             "(retry %d/%d)", source.get("name"), offset, e,
+                             delay, retry_num + 1, PAGE_RETRY_ATTEMPTS)
+                    time.sleep(delay)
+
+        if resp is None:
+            log.info("[%s] ajax_paginate stopped at offset %d after %d extra "
+                     "retries: %s", source.get("name"), offset,
+                     PAGE_RETRY_ATTEMPTS, last_err)
             break
 
         try:
