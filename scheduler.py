@@ -178,29 +178,31 @@ def _run_dupe_merge():
     """
     Daily safety-net job -- finds and merges the same high-confidence
     fuzzy duplicate pairs merge_fuzzy_dupes.py's CLI would find, using
-    the exact same find_pairs()/plan_merge()/apply_merge() functions
-    (imported directly, not shelled out to) so this can never drift out
-    of sync with the manually-run version. Deliberately does NOT call
-    merge_fuzzy_dupes.main() -- that function does its own
+    the exact same find_pairs()/plan_merge()/apply_merge()/merge_all()
+    functions (imported directly, not shelled out to) so this can never
+    drift out of sync with the manually-run version. Deliberately does
+    NOT call merge_fuzzy_dupes.main() -- that function does its own
     argparse.parse_args(), which would try to parse this daemon's own
     argv instead of a real --apply flag.
+
+    Uses merge_all() rather than looping over pairs directly so a 3+-way
+    duplicate cluster (multiple pairs that don't agree on one primary)
+    can't leave a later pair updating/merging into a post an earlier
+    pair in this same run already deleted -- see merge_all()'s docstring.
     """
     from db import get_connection
-    from merge_fuzzy_dupes import find_pairs, plan_merge, apply_merge
+    from merge_fuzzy_dupes import find_pairs, merge_all
+
+    def _log_errors_only(line):
+        if line.startswith("        ERROR"):
+            log.error("Dupe merge: %s", line.strip())
 
     conn = get_connection()
     try:
         pairs = find_pairs(conn)
-        merged = 0
-        for ratio, a, b in pairs:
-            primary, secondary, updates = plan_merge(a, b)
-            try:
-                apply_merge(conn, primary, secondary, updates)
-                merged += 1
-            except Exception as e:
-                log.error("Dupe merge failed for pair (%d, %d): %s",
-                          a["post_id"], b["post_id"], e, exc_info=True)
-        log.info("Dupe merge: %d/%d duplicate pairs merged", merged, len(pairs))
+        _, merged, skipped_stale = merge_all(conn, pairs, apply=True, log_fn=_log_errors_only)
+        log.info("Dupe merge: %d/%d duplicate pairs merged (%d stale-skipped)",
+                  merged, len(pairs), skipped_stale)
     except Exception as e:
         log.error("Dupe merge job failed: %s", e, exc_info=True)
     finally:

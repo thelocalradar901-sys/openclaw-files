@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+*.zip
+*.bak
+*.bak3
+*.tar.gz
+backups/
+triage_html_dump/
+triage_html_dump_prev_*/
+openclaw_release/
+db.dy
+.claude/
