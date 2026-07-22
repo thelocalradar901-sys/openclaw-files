@@ -320,20 +320,39 @@ _AMPERSAND_RE = re.compile(r"\s*&\s*")
 # matched on the "Silverstein ... Story of the Year" core; the trailing
 # "(16 and Over)" was dead weight dragging down both the similarity ratio
 # AND the token-containment check (its tokens don't appear on the other
-# side at all). NOT the same pattern as the numbered-occurrence guard in
-# merge_fuzzy_dupes.py, which deliberately keeps "(Night 2)" vs "(Night 3)"
-# from merging -- that guard runs on the RAW title before this stripping
-# ever happens, so it's unaffected. Applied in a loop since a title could
-# in principle carry more than one trailing group.
-_TRAILING_PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+# side at all).
+#
+# CRITICAL EXCLUSION: numbered-occurrence markers -- "(Night 2)", "(Night
+# 3)", "(Day 1)", "(Part 2)", "(Show 1)", "(Set 2)" -- must NEVER be
+# stripped here, even though they're syntactically identical trailing
+# parentheticals. This function feeds make_fingerprint() directly, which
+# is used for exact-hash duplicate detection (recompute_fingerprints.py,
+# insert_event()'s primary path) -- code paths that run BEFORE and
+# INDEPENDENTLY of merge_fuzzy_dupes.py's own numbered-occurrence guard,
+# so stripping these here would silently bypass that guard rather than
+# respect it. Confirmed the hard way 2026-07-21: an earlier version of
+# this function stripped ALL trailing parens unconditionally, and
+# recompute_fingerprints.py immediately flagged "Tedeschi Trucks Band"
+# and "Tedeschi Trucks Band (Night 2)" -- two real, separately-ticketed
+# shows in an actual multi-night residency -- as an exact-fingerprint
+# duplicate pair, which would have deleted a legitimate distinct event.
+# Applied in a loop since a title could in principle carry more than one
+# trailing group (the loop stops as soon as it hits a numbered-occurrence
+# group, leaving it and anything to its left untouched).
+_TRAILING_PAREN_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
+_NUMBERED_OCCURRENCE_RE = re.compile(
+    r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
+)
 
 
 def _strip_trailing_parens(title: str) -> str:
     while True:
-        stripped = _TRAILING_PAREN_RE.sub("", title)
-        if stripped == title:
+        match = _TRAILING_PAREN_RE.search(title)
+        if not match:
             return title
-        title = stripped
+        if _NUMBERED_OCCURRENCE_RE.search(match.group(0)):
+            return title
+        title = title[:match.start()].rstrip()
 
 
 def normalize_title_for_matching(title: str) -> str:
