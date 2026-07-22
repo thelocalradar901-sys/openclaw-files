@@ -671,13 +671,25 @@ def _parse_jsonld(html: str, source: dict, city_slug: str, city_name: str) -> li
                 else (img[0] if isinstance(img, list) and img and isinstance(img[0], str)
                       else img[0].get("url", "") if isinstance(img, list) and img else "")
             )
+            ticket_url = item.get("url", item.get("@id", "")).strip()
+
+            # og:image fallback -- same pattern already used in _parse_ical,
+            # _parse_rhp, and _parse_heuristic, but this tier never had it.
+            # Confirmed 2026-07-20 on Warner Parks and Woolworth Theatre:
+            # both publish Event JSON-LD with no "image" field at all, even
+            # though their own event detail pages carry a real og:image tag
+            # -- so every event from either source was landing with a blank
+            # thumbnail, even though the destination page clearly has one.
+            if not image_url and ticket_url:
+                image_url = _fetch_og_image(ticket_url)
+
             events.append(_ev(
                 title=title,
                 description=item.get("description", "").strip(),
                 start_date=_normalize_dt(start_raw),
                 end_date=_normalize_dt(item.get("endDate", start_raw)),
                 venue_name=venue_name,
-                ticket_url=item.get("url", item.get("@id", "")).strip(),
+                ticket_url=ticket_url,
                 source=source, city_slug=city_slug, city_name=city_name,
                 image_url=image_url,
             ))
