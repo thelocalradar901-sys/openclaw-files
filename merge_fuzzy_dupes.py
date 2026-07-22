@@ -43,6 +43,11 @@ _NUMBERED_OCCURRENCE_RE = re.compile(
     r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
 )
 
+# "vs" / "vs." / "v." as a whole word -- see the fixture guard comment
+# below for why the period-abbreviated forms had to be added on top of
+# the plain " vs " check.
+_FIXTURE_RE = re.compile(r"\bvs?\.?\s", re.IGNORECASE)
+
 _LINEUP_SHOW_RE = re.compile(
     r"\bfeaturing\b|\bfeat\.|\blineup\b|&\s*friends\b|\bin the round\b", re.IGNORECASE
 )
@@ -246,8 +251,20 @@ def find_pairs(conn):
                 # only ever safe to treat as the same event via the EXACT
                 # fingerprint path (make_fingerprint()), never via fuzzy
                 # similarity here.
-                a_is_fixture = " vs " in f' {a["_norm_title"]} '
-                b_is_fixture = " vs " in f' {b["_norm_title"]} '
+                #
+                # Broadened 2026-07-21: the literal " vs " (space-bounded,
+                # no period) check missed "Auburn v. UCF" vs "Auburn vs.
+                # Florida State" -- two genuinely different games -- since
+                # both use a period-abbreviated "v."/"vs." that never
+                # produces a bare " vs " substring. Confirmed these two
+                # scored 0.81, ABOVE threshold, and would have deleted a
+                # real, separately-ticketed game. Now matches "vs", "vs.",
+                # or "v." as a whole token (word-boundary before, so this
+                # never fires on a title that merely contains a word
+                # ending in "v" or "vs" as a substring, e.g. "Vs." can't
+                # match inside "Elvis").
+                a_is_fixture = bool(_FIXTURE_RE.search(a["_norm_title"]))
+                b_is_fixture = bool(_FIXTURE_RE.search(b["_norm_title"]))
                 if a_is_fixture or b_is_fixture:
                     continue
 

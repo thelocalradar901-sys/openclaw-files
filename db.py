@@ -301,15 +301,69 @@ _PROMO_SUFFIX_RE = re.compile("|".join(_PROMO_SUFFIX_PATTERNS), re.IGNORECASE)
 _CITY_STATE_SUFFIX_RE = re.compile(r"\s*[–—-]\s*[A-Za-z .'\-]+,\s*[A-Z]{2}\s*$")
 _AT_SIGN_RE = re.compile(r"\s@\s")
 
+# "&" vs "and" is a pure formatting choice different sources make
+# differently for the exact same bill -- confirmed 2026-07-20: "Edge of
+# Paradise and Starkill" (one source) vs "Edge Of Paradise & Starkill"
+# (The Federal Theatre's own listing) never even reached the similarity
+# check as the same event because the two tokens don't share a single
+# character where they diverge. Collapsing both to "and" here (comparison
+# key only) means every existing "&"-vs-"and" pair in the codebase's
+# other guards (token containment, prefix match) sees the same word on
+# both sides instead of silently losing that token.
+_AMPERSAND_RE = re.compile(r"\s*&\s*")
+
+# Trailing parenthetical annotations -- age restrictions ("(16 and Over)",
+# "(21+)"), rescheduling notes, etc. -- describe the LISTING, not the
+# event's identity, and one source frequently omits what another
+# includes. Confirmed 2026-07-20: "Silverstein and Story of the Year (16
+# and Over)" vs "Silverstein & Story of the Year: CAMP SCREAMO TOUR" only
+# matched on the "Silverstein ... Story of the Year" core; the trailing
+# "(16 and Over)" was dead weight dragging down both the similarity ratio
+# AND the token-containment check (its tokens don't appear on the other
+# side at all).
+#
+# CRITICAL EXCLUSION: numbered-occurrence markers -- "(Night 2)", "(Night
+# 3)", "(Day 1)", "(Part 2)", "(Show 1)", "(Set 2)" -- must NEVER be
+# stripped here, even though they're syntactically identical trailing
+# parentheticals. This function feeds make_fingerprint() directly, which
+# is used for exact-hash duplicate detection (recompute_fingerprints.py,
+# insert_event()'s primary path) -- code paths that run BEFORE and
+# INDEPENDENTLY of merge_fuzzy_dupes.py's own numbered-occurrence guard,
+# so stripping these here would silently bypass that guard rather than
+# respect it. Confirmed the hard way 2026-07-21: an earlier version of
+# this function stripped ALL trailing parens unconditionally, and
+# recompute_fingerprints.py immediately flagged "Tedeschi Trucks Band"
+# and "Tedeschi Trucks Band (Night 2)" -- two real, separately-ticketed
+# shows in an actual multi-night residency -- as an exact-fingerprint
+# duplicate pair, which would have deleted a legitimate distinct event.
+# Applied in a loop since a title could in principle carry more than one
+# trailing group (the loop stops as soon as it hits a numbered-occurrence
+# group, leaving it and anything to its left untouched).
+_TRAILING_PAREN_RE = re.compile(r"\s*\(([^()]*)\)\s*$")
+_NUMBERED_OCCURRENCE_RE = re.compile(
+    r"\((?:night|day|part|show|set)\s*\d+\)", re.IGNORECASE
+)
+
+
+def _strip_trailing_parens(title: str) -> str:
+    while True:
+        match = _TRAILING_PAREN_RE.search(title)
+        if not match:
+            return title
+        if _NUMBERED_OCCURRENCE_RE.search(match.group(0)):
+            return title
+        title = title[:match.start()].rstrip()
+
 
 def normalize_title_for_matching(title: str) -> str:
     """
-    Strip known promotional/reseller suffixes and Eventim's trailing
-    city/state tag, and normalize "@" to "at", before using a title for
-    fingerprinting or fuzzy cross-source matching. NEVER used to set
-    the actual displayed post_title -- only to compute a more reliable
-    comparison key, so a matched listing still shows whatever the
-    source's real title was.
+    Strip known promotional/reseller suffixes, Eventim's trailing
+    city/state tag, and trailing parenthetical annotations; normalize
+    "@" to "at" and "&" to "and"; before using a title for fingerprinting
+    or fuzzy cross-source matching. NEVER used to set the actual
+    displayed post_title -- only to compute a more reliable comparison
+    key, so a matched listing still shows whatever the source's real
+    title was.
 
     NOTE: this feeds make_fingerprint() as well as find_cross_source_match().
     Changing this function changes the fingerprint hash for any existing
@@ -318,7 +372,9 @@ def normalize_title_for_matching(title: str) -> str:
     """
     cleaned = _PROMO_SUFFIX_RE.sub("", (title or "").strip())
     cleaned = _CITY_STATE_SUFFIX_RE.sub("", cleaned)
+    cleaned = _strip_trailing_parens(cleaned)
     cleaned = _AT_SIGN_RE.sub(" at ", cleaned)
+    cleaned = _AMPERSAND_RE.sub(" and ", cleaned)
     return cleaned.strip().lower()
 
 
@@ -346,8 +402,19 @@ def _is_headliner_prefix_match(short_title: str, long_title: str) -> bool:
         something like "Live" doesn't prefix-match half the calendar
       - must be a WORD boundary, not a mid-word truncation -- long_title
         must equal short_title exactly, or the very next character must
-        be a separator (space, pipe, paren, dash) so "blues travel" does
-        NOT prefix-match "blues traveler" (real different event/typo)
+        be a separator (space, pipe, paren, dash, colon) so "blues travel"
+        does NOT prefix-match "blues traveler" (real different event/typo)
+
+    Colon added to the separator set 2026-07-20: "Grand Ole Opry: OPRY
+    100" vs "Grand Ole Opry: OPRY 100 Featuring Lainey Wilson, Switchfoot,
+    ..." is a bare-title/full-lineup pair exactly like the Blues Traveler
+    case above, just with the shared boilerplate ending mid-title at a
+    colon instead of at a space -- the character right after the shared
+    prefix is a space either way (it's the shared "Grand Ole Opry: OPRY
+    100" itself that contains the colon), so this only matters for
+    titles where the divergence point IS the colon, e.g. "Silverstein and
+    Story of the Year" (post-paren-stripping) vs "Silverstein and Story
+    of the Year: Camp Screamo Tour".
     """
     if len(short_title) < _MIN_PREFIX_MATCH_LEN:
         return False
@@ -356,7 +423,7 @@ def _is_headliner_prefix_match(short_title: str, long_title: str) -> bool:
     if len(long_title) == len(short_title):
         return True
     next_char = long_title[len(short_title)]
-    return next_char in " |(-"
+    return next_char in " |(-:"
 
 
 def find_cross_source_match(conn, event: dict, resolved_times: dict) -> int | None:
