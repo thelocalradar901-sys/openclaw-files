@@ -12,8 +12,10 @@ continues regardless.
 """
 
 import logging
+from datetime import timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
@@ -25,6 +27,13 @@ log = logging.getLogger("openclaw.scheduler")
 _cities  = []
 _sources = {}   # { city_slug: [source_dict, ...] }
 
+# Spacing (seconds) between each job's forced initial next_run_time, so ~75
+# jobs don't all fire in the same instant -- see the staggering comment in
+# start_scheduler() for why an unstaggered pile-up here recreates itself
+# every future cycle, not just on startup.
+TM_STAGGER_SECONDS      = 15
+SCRAPER_STAGGER_SECONDS = 8
+
 
 def start_scheduler() -> BackgroundScheduler:
     """Build and start the APScheduler. Returns the running scheduler."""
@@ -32,7 +41,18 @@ def start_scheduler() -> BackgroundScheduler:
     _cities  = load_cities()
     _sources = load_dynamic_sources()
 
-    scheduler = BackgroundScheduler(timezone="UTC")
+    # Default executor is a 10-worker pool. All ~75 TM + scraper jobs fire
+    # simultaneously every cycle (see the on-startup next_run_time reset
+    # below), and 10 workers can't drain that backlog before misfire_grace_
+    # time expires -- confirmed 2026-07-22: Larimer Lounge, Colorado
+    # Railroad Museum, and Highlands Ranch Mansion were silently dropped
+    # every single cycle for 5+ days because they consistently landed in a
+    # queue position the pool didn't reach in time. 25 workers gives enough
+    # headroom to drain the full job set well inside the grace window.
+    scheduler = BackgroundScheduler(
+        timezone="UTC",
+        executors={"default": ThreadPoolExecutor(25)},
+    )
 
     # ── Ticketmaster jobs ─────────────────────────────────────────────────────
     for city in _cities:
@@ -52,10 +72,14 @@ def start_scheduler() -> BackgroundScheduler:
             # missed its immediate on-startup fire this way -- with
             # dozens of jobs (4 TM + every scraper + Eventim) all queued
             # at once on restart, the thread pool routinely takes more
-            # than 1s to reach each one. 300s of slack costs nothing
-            # (a TM pull running up to 5 minutes "late" is irrelevant at
-            # a 1-hour interval) and stops this class of silent no-op.
-            misfire_grace_time=300,
+            # than 1s to reach each one. Bumped 300 -> 900 on 2026-07-22
+            # after the 10-worker pool (now 25, see start_scheduler) still
+            # wasn't draining the full ~75-job backlog inside 300s, which
+            # was silently dropping the same few jobs every cycle. 900s of
+            # slack costs nothing (a TM pull running up to 15 minutes
+            # "late" is irrelevant at a 1-hour interval) and gives real
+            # margin on top of the larger pool.
+            misfire_grace_time=900,
         )
         log.info("Scheduled Ticketmaster job for %s (every %ds)", city["name"], TICKETMASTER_INTERVAL)
 
@@ -73,7 +97,7 @@ def start_scheduler() -> BackgroundScheduler:
                 max_instances=1,
                 # Same misfire reasoning as the TM jobs above -- see that
                 # comment for the full explanation.
-                misfire_grace_time=300,
+                misfire_grace_time=900,
             )
     log.info("Scheduled %d scraper jobs", sum(len(v) for v in _sources.values()))
 
@@ -85,7 +109,7 @@ def start_scheduler() -> BackgroundScheduler:
         id="refresh_db",
         name="Refresh cities + sources from WP DB",
         replace_existing=True,
-        misfire_grace_time=300,
+        misfire_grace_time=900,
     )
 
     # ── Fuzzy duplicate merge job ─────────────────────────────────────────────
@@ -114,15 +138,28 @@ def start_scheduler() -> BackgroundScheduler:
 
     scheduler.start()
 
-    # Fire Ticketmaster and scrapers immediately on startup
-    for city in _cities:
-        scheduler.get_job(f"tm_{city['slug']}").modify(next_run_time=_now())
+    # Fire Ticketmaster and scrapers on startup, staggered rather than all
+    # at once. Forcing every job's next_run_time to the identical instant
+    # recreates the exact thundering-herd/Ollama-contention pile-up the
+    # pool-size and misfire_grace_time changes above were compensating for
+    # -- and since IntervalTrigger just keeps adding its own interval to
+    # whatever anchor it's given, an unstaggered pile-up here resyncs every
+    # job back onto the same instant for every future cycle too, not just
+    # this one startup. Spreading the initial fire by a few seconds per job
+    # keeps that spread permanently without changing any job's own cadence.
+    now = _now()
+    for i, city in enumerate(_cities):
+        scheduler.get_job(f"tm_{city['slug']}").modify(
+            next_run_time=now + timedelta(seconds=i * TM_STAGGER_SECONDS)
+        )
+    i = 0
     for city_slug, source_list in _sources.items():
         for source in source_list:
             job_id = f"scraper_{city_slug}_{source['_db_id']}"
             job = scheduler.get_job(job_id)
             if job:
-                job.modify(next_run_time=_now())
+                job.modify(next_run_time=now + timedelta(seconds=i * SCRAPER_STAGGER_SECONDS))
+                i += 1
 
     log.info("Scheduler started with %d cities, %d sources",
              len(_cities), sum(len(v) for v in _sources.values()))
@@ -224,7 +261,13 @@ def _refresh_cities_and_sources(scheduler: BackgroundScheduler):
     _cities  = new_cities
     _sources = new_sources
 
+    # New jobs get staggered next_run_times too (see start_scheduler) --
+    # otherwise a refresh that picks up several new sources at once fires
+    # all of them the instant they're added.
+    now = _now()
+
     # Add any new Ticketmaster jobs
+    tm_added = 0
     for city in _cities:
         job_id = f"tm_{city['slug']}"
         if not scheduler.get_job(job_id):
@@ -236,11 +279,16 @@ def _refresh_cities_and_sources(scheduler: BackgroundScheduler):
                 name=f"Ticketmaster - {city['name']}",
                 replace_existing=True,
                 max_instances=1,
-                misfire_grace_time=300,
+                misfire_grace_time=900,
             )
+            scheduler.get_job(job_id).modify(
+                next_run_time=now + timedelta(seconds=tm_added * TM_STAGGER_SECONDS)
+            )
+            tm_added += 1
             log.info("Added new Ticketmaster job for %s", city["name"])
 
     # Add any new scraper jobs
+    scraper_added = 0
     for city_slug, source_list in _sources.items():
         for source in source_list:
             job_id = f"scraper_{city_slug}_{source['_db_id']}"
@@ -253,8 +301,12 @@ def _refresh_cities_and_sources(scheduler: BackgroundScheduler):
                     name=f"{source['name']}/{city_slug}",
                     replace_existing=True,
                     max_instances=1,
-                    misfire_grace_time=300,
+                    misfire_grace_time=900,
                 )
+                scheduler.get_job(job_id).modify(
+                    next_run_time=now + timedelta(seconds=scraper_added * SCRAPER_STAGGER_SECONDS)
+                )
+                scraper_added += 1
                 log.info("Added new scraper job: %s / %s", source["name"], city_slug)
 
     log.info("Refresh complete: %d cities, %d sources",
