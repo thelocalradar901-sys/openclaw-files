@@ -29,6 +29,9 @@ WP_PREFIX = os.getenv("WP_PREFIX", "wp_")
 
 # ── Ticketmaster ──────────────────────────────────────────────────────────────
 TICKETMASTER_API_KEY = os.getenv("TICKETMASTER_API_KEY", "")
+
+# ── Google Places (venue enrichment) ──────────────────────────────────────────
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 TM_RADIUS       = "50"
 TM_UNIT         = "miles"
 TM_SIZE         = 200
@@ -48,6 +51,7 @@ EVENTIM_AFF_ID     = os.getenv("EVENTIM_AFF_ID", "40")
 
 # ── Ollama / Qwen3 ────────────────────────────────────────────────────────────
 OLLAMA_HOST    = os.getenv("OLLAMA_HOST",    "http://localhost:11434")
+HTML_RELAY_URL = os.getenv("HTML_RELAY_URL", "")
 OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL",   "qwen3:14b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", 60))
 
