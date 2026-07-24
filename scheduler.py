@@ -12,6 +12,8 @@ continues regardless.
 """
 
 import logging
+import queue
+import threading
 from datetime import timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -33,6 +35,21 @@ _sources = {}   # { city_slug: [source_dict, ...] }
 # every future cycle, not just on startup.
 TM_STAGGER_SECONDS      = 15
 SCRAPER_STAGGER_SECONDS = 8
+
+# Events awaiting an Ollama-generated description, drained by a single
+# dedicated background thread (see _enrichment_worker) instead of being
+# generated inline on a scraper job's own pool thread. Ollama only
+# meaningfully processes ~1 generation request at a time, so scraper jobs
+# that called it inline were tying up a pool worker for the full duration
+# of every serial Ollama call they needed -- confirmed 2026-07-23: all 25
+# pool workers were simultaneously occupied at the exact moment 11
+# Nashville jobs missed their dispatch window, because earlier-staggered
+# jobs elsewhere in the cycle were each sitting on a worker for 20-40+
+# minutes waiting on Ollama. Queueing enrichment separately means
+# insert_event() finishes in seconds again regardless of how deep the
+# enrichment backlog gets, so pool workers free up promptly and later
+# jobs in the same cycle still get dispatched on time.
+_enrichment_queue = queue.Queue()
 
 
 def start_scheduler() -> BackgroundScheduler:
@@ -161,6 +178,8 @@ def start_scheduler() -> BackgroundScheduler:
                 job.modify(next_run_time=now + timedelta(seconds=i * SCRAPER_STAGGER_SECONDS))
                 i += 1
 
+    threading.Thread(target=_enrichment_worker, name="enrichment-worker", daemon=True).start()
+
     log.info("Scheduler started with %d cities, %d sources",
              len(_cities), sum(len(v) for v in _sources.values()))
     return scheduler
@@ -187,18 +206,18 @@ def _run_ticketmaster(city: dict):
 
 def _run_scraper(source: dict, city: dict):
     from scraper import scrape_source
-    from enricher import enrich_events
     from db import insert_event
 
     try:
         events   = scrape_source(source, city)
-        events   = enrich_events(events)
         inserted = skipped = 0
         for event in events:
             if insert_event(event, city):
                 inserted += 1
             else:
                 skipped += 1
+            if not (event.get("description") or "").strip() or event.get("_needs_enrichment"):
+                _enrichment_queue.put((event, city))
         log.info("Scraper '%s' %s: %d inserted, %d skipped",
                  source["name"], city["name"], inserted, skipped)
 
@@ -209,6 +228,64 @@ def _run_scraper(source: dict, city: dict):
     except Exception as e:
         log.error("Scraper failed for %s/%s: %s",
                   source.get("name"), city.get("name"), e, exc_info=True)
+
+
+def _enrichment_worker():
+    """
+    Runs continuously in its own dedicated thread for the life of the
+    process, one event at a time -- matching Ollama's real throughput
+    instead of however many scraper jobs happen to be concurrently
+    dispatched. See the _enrichment_queue comment above for why this is
+    decoupled from the scraper thread pool at all.
+
+    Writes the generated description with a minimal, targeted UPDATE --
+    deliberately NOT full update_event(). First version of this called
+    update_event(), which redundantly re-runs _apply_categories(),
+    _apply_image(), and _write_tec_index() on every backfill; those do
+    DELETE+INSERT churn on term_relationships/postmeta, and because this
+    worker's write now happens asynchronously and LATER than the
+    original scrape (rather than inline in the same writer, like before
+    this queue existed), it frequently landed at the same moment as that
+    same post's own next 2-hour scrape cycle also calling update_event()
+    -- two independent writers racing on the same rows. Confirmed
+    2026-07-24: deadlock rate went from ~0.27/hour to ~220/hour within
+    hours of deploying the queued version. Categories/image/TEC-index
+    are already handled correctly by the original insert/update call;
+    this only ever needs to fill in post_content.
+    """
+    from datetime import datetime
+    from config import WP_PREFIX
+    from db import get_connection, resolve_event_times, make_fingerprint, get_fingerprint_post_id
+    from enricher import _generate
+
+    while True:
+        event, city_config = _enrichment_queue.get()
+        try:
+            desc = _generate(event)
+            if not desc:
+                continue
+            enriched = {**event, "description": desc}
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            t   = resolve_event_times(enriched, now)
+            fp  = make_fingerprint(enriched, resolved_times=t)
+
+            conn = get_connection()
+            try:
+                post_id = get_fingerprint_post_id(conn, fp)
+                if post_id:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"UPDATE {WP_PREFIX}posts SET post_content=%s, post_modified=%s, post_modified_gmt=%s "
+                            f"WHERE ID=%s AND (post_content='' OR post_content IS NULL)",
+                            (desc, now, now, post_id)
+                        )
+                    conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            log.error("Enrichment worker failed for '%s'", event.get("title"), exc_info=True)
+        finally:
+            _enrichment_queue.task_done()
 
 
 def _run_dupe_merge():
