@@ -428,6 +428,7 @@ def _guess_timezone(city_slug: str) -> str:
         "nashville":  "America/Chicago",
         "birmingham": "America/Chicago",
         "denver":     "America/Denver",
+        "tampa":      "America/New_York",
     }.get(city_slug, "America/Chicago")
 
 
