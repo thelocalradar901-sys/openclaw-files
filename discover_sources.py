@@ -33,6 +33,11 @@ already does for manually-added sources.
 
 Run with --dry-run (default) first. Pass --apply to actually write
 new sources to the DB.
+
+Ad-hoc single-city mode: pass --city-name/--slug/--lat/--lng (and
+optionally --radius-miles) to run discovery for one city that isn't
+in wp_openclaw_cities yet -- e.g. a new market still in pre-launch
+discovery, kept off the public site until it's flipped to 'active'.
 """
 
 import argparse
@@ -72,7 +77,9 @@ PLACES_TYPE_QUERIES = {
     "performing arts center": ["performing_arts_theater"],
 }
 
-SEARCH_RADIUS_METERS = 40000.0  # ~25 miles -- matches your existing TM_RADIUS scale
+SEARCH_RADIUS_METERS = 40000.0  # ~25 miles -- default fallback if a city has no radius_miles
+PLACES_MAX_RADIUS_METERS = 50000.0  # Google searchNearby hard cap -- larger radii return 400
+METERS_PER_MILE = 1609.34
 
 ICAL_PATHS = ["/events/?ical=1", "/events/list/?ical=1", "/?ical=1", "/events.ics"]
 
@@ -185,8 +192,10 @@ def discover_for_city(city: dict, conn, dry_run: bool) -> list[dict]:
     found = []
     known = existing_domains(conn)
 
+    radius_m = min(city.get("radius_miles", 25) * METERS_PER_MILE, PLACES_MAX_RADIUS_METERS)
+
     for category, included_types in PLACES_TYPE_QUERIES.items():
-        places = places_search(included_types, city["lat"], city["lng"], SEARCH_RADIUS_METERS)
+        places = places_search(included_types, city["lat"], city["lng"], radius_m)
         log.info("'%s' near %s: %d results with a website", category, city["name"], len(places))
 
         for place in places:
@@ -266,12 +275,35 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true",
                      help="Actually write new sources + send email. Default is dry-run.")
+    ap.add_argument("--city-name", help="Ad-hoc city name, e.g. 'Tampa'. Bypasses "
+                     "wp_openclaw_cities entirely -- use for pre-launch discovery on a "
+                     "city that isn't 'active' (and therefore isn't on the public site) "
+                     "yet. Requires --slug, --lat, --lng.")
+    ap.add_argument("--slug", help="Ad-hoc city slug, e.g. 'tampa'.")
+    ap.add_argument("--lat", type=float, help="Ad-hoc city latitude.")
+    ap.add_argument("--lng", type=float, help="Ad-hoc city longitude.")
+    ap.add_argument("--radius-miles", type=int, default=35,
+                     help="Ad-hoc city radius in miles (default 35).")
     args = ap.parse_args()
     dry_run = not args.apply
 
     conn = get_connection()
     try:
-        cities = load_cities()
+        if args.city_name:
+            if not (args.slug and args.lat is not None and args.lng is not None):
+                print("--city-name requires --slug, --lat, and --lng")
+                sys.exit(1)
+            cities = [{
+                "name": args.city_name,
+                "slug": args.slug,
+                "lat": args.lat,
+                "lng": args.lng,
+                "radius_miles": args.radius_miles,
+            }]
+            log.info("Ad-hoc city mode: %s (%s), %s mi radius -- NOT reading/writing "
+                      "wp_openclaw_cities", args.city_name, args.slug, args.radius_miles)
+        else:
+            cities = load_cities()
         all_found = []
         for city in cities:
             log.info("=== Discovering sources for %s ===", city["name"])
